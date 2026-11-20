@@ -18,20 +18,72 @@ def _region_to_extent(
 ) -> Iterator[int]:
     chrom, start, end = region
     cid = chrom_ids[chrom]
-    if binsize is not None:
-        chrom_offset = h5["indexes"]["chrom_offset"][cid]
-        yield chrom_offset + int(np.floor(start / binsize))
-        yield chrom_offset + int(np.ceil(end / binsize))
-    else:
-        chrom_lo = h5["indexes"]["chrom_offset"][cid]
-        chrom_hi = h5["indexes"]["chrom_offset"][cid + 1]
-        chrom_bins = h5["bins"]["start"][chrom_lo:chrom_hi]
-        # Clip at the chromosome's first bin, so that a region starting before
-        # it, or on a chromosome without bins, can't reach the previous one
-        yield chrom_lo + chrom_lo.dtype.type(
-            max(np.searchsorted(chrom_bins, start, "right") - 1, 0)
-        )
-        yield chrom_lo + chrom_lo.dtype.type(np.searchsorted(chrom_bins, end, "left"))
+    chrom_offset = h5["indexes"]["chrom_offset"]
+    c_lo = int(chrom_offset[cid])
+    c_hi = int(chrom_offset[cid + 1])
+    # Bin IDs are half-open intervals [c_lo, c_hi), whether or not the bins
+    # are uniform: a sparse bin layout has gaps, and a chromosome may have no
+    # bins at all. So select the bins that actually overlap [start, end); the
+    # range is empty for an empty region.
+    if c_hi <= c_lo:
+        yield c_lo
+        yield c_lo
+        return
+    if binsize is not None and _uses_offsets(h5, cid, c_lo, c_hi, binsize):
+        i0 = c_lo + int(np.floor(start / binsize))
+        i1 = c_lo + int(np.ceil(end / binsize))
+        i0 = min(max(i0, c_lo), c_hi)
+        i1 = min(max(i1, i0, c_lo), c_hi)
+        if end <= start:
+            yield i0
+            yield i0
+            return
+        yield i0
+        yield i1
+        return
+    # Variable-size bins, or (the same thing from here) a region of the file
+    # with gaps: select the bins whose half-open interval overlaps the query.
+    starts = h5["bins"]["start"][c_lo:c_hi]
+    ends = h5["bins"]["end"][c_lo:c_hi]
+    # First bin whose end is after the query start
+    i0 = int(np.searchsorted(ends, start, "right"))
+    if end <= start:
+        # An empty region overlaps nothing
+        i0 = min(i0, c_hi - c_lo)
+        yield min(c_lo + i0, c_hi)
+        yield min(c_lo + i0, c_hi)
+        return
+    # First bin whose start is at or after the query end
+    i1 = int(np.searchsorted(starts, end, "left"))
+    i1 = max(i0, i1)
+    yield min(c_lo + i0, c_hi)
+    yield min(c_lo + i1, c_hi)
+
+
+def _is_sparse_layout(h5: h5py.Group) -> bool:
+    """Whether the bin table is a marked sparse layout, with gaps."""
+    value = h5.attrs.get("bin-layout", None)
+    if isinstance(value, bytes):
+        value = value.decode()
+    return value == "sparse"
+
+
+def _uses_offsets(
+    h5: h5py.Group, cid: int, c_lo: int, c_hi: int, binsize: int
+) -> bool:
+    """
+    Whether fixed-size offset arithmetic selects the right bins.
+
+    A marked sparse layout has gaps, so its coordinates must be read. For
+    other files, a uniform bin table that doesn't start at 0 (written before
+    bin tables were checked) would give wrong offsets, so its coordinates are
+    read too.
+    """
+    if _is_sparse_layout(h5):
+        return False
+    if c_hi <= c_lo:
+        return True
+    return int(h5["bins"]["start"][c_lo]) == 0
 
 
 def region_to_offset(

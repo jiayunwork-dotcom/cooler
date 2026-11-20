@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### New features
+* `coarsen_cooler(..., target_bins=...)` and `cooler coarsen --target-bins <BED>` pool an explicit, possibly ragged set of genomic intervals instead of an integer-factor grid. Each target interval (columns `chrom`, `start`, `end`) must be a run of whole source bins, in sorted, non-overlapping order; source bins, whole chromosomes, or everything may be omitted, and the output keeps the source chromosome catalog and lengths. The row order sets the output bin IDs, and only source pixels whose both bins are retained take part. `count` stays exact; symmetric-upper storage counts a target pair once (including off-diagonal contacts that merge onto the diagonal), while square storage keeps direction. `factor` must be `None` when `target_bins` is given; otherwise the existing integer-factor behavior is unchanged. Invalid tables raise `ValueError` before the output is created, and the caller's table isn't modified.
+* `zoomify_cooler(..., bin_levels={name: target_bins})` and `cooler zoomify --bin-level <name>=<BED>` store named, possibly sparse levels under `/bin_levels/<name>` instead of integer-resolution MCOOL directories. `bin_levels` is mutually exclusive with non-empty `resolutions`; level names are limited to ASCII letters, digits, underscores and hyphens, starting with a letter or digit. Every table is validated against the original input first. A level is built from another level only when that is exactly equivalent to aggregating from the base; otherwise it is built from the base. The result doesn't depend on the insertion order of the mapping.
+* The bin table may now be a **sparse layout**, marked by the file attribute `bin-layout: sparse`: an extension to the cooler format, documented in `docs/schema_v3.rst`. Ordinary `create_cooler` still requires tiling bins.
+
+### Behavior changes
+* Genomic range queries on a marked sparse layout, and on any other non-uniform bin table this version can open, select the bins whose half-open interval actually overlaps the query. A query in a gap, before the first bin, after the last bin, on a chromosome without bins, or of zero length returns an empty range; a query crossing a gap returns only the bins on either side that really overlap it. `fetch` row/column IDs agree with the equivalent integer slice. Fully tiled files keep the shortest-covering-range behavior.
+
 ### Bug fixes
 * fix: When worker processes fail to start, parallel commands and functions raise `cooler.parallel.WorkerStartError`, a subclass of `WorkerDiedError`, saying so, instead of suggesting that a worker ran out of memory. With the `spawn` or `forkserver` start method (macOS, and Linux from Python 3.14), the most common cause is a script that starts them outside `if __name__ == "__main__":`, which the message points out. The CLI no longer suggests fewer processes or smaller chunks in this case.
 

@@ -170,6 +170,118 @@ The matrix selector’s fetch method is intended to represent a **2D range query
     >>> A4 = c.matrix().fetch('chr2', 'chr3')
     >>> A5 = c.matrix().fetch('chr3:10M-20M', 'chr3:35M-40M')
 
+Archiving selected intervals: ragged bins
+-----------------------------------------
+
+Ordinary coarsening requires an integer factor: every *k*-by-*k* block of
+uniform bins is pooled, so the output always tiles the genome at a new uniform
+resolution. Sometimes you want something else: keep a few regions at a fine
+granularity, merge others into coarser bins, and leave the stretches in
+between out entirely. That output does not tile the genome, so the
+integer-factor machinery cannot express it.
+
+:func:`cooler.coarsen_cooler` accepts an explicit ``target_bins`` table for
+this. Each row of the table (columns ``chrom``, ``start``, ``end``) defines an
+output bin, in row order, and must be *exactly a run of whole source bins*:
+target intervals can't split a source bin, cross a chromosome, or cover
+coordinates the source bin table doesn't cover. Source bins, whole
+chromosomes, and even everything may be omitted.
+
+.. code-block:: python
+
+    >>> import pandas as pd, cooler
+    >>> src = cooler.Cooler('data/WT.DpnII.10kb.cool')
+    >>> tb = pd.DataFrame({
+    ...     'chrom': ['chr1', 'chr1', 'chr1', 'chr18'],
+    ...     'start': [0, 50_000_000, 90_000_000, 0],
+    ...     'end':   [50_000_000, 90_000_000, 100_000_000, 80_000_000],
+    ... })
+    >>> cooler.coarsen_cooler(
+    ...     'data/WT.DpnII.10kb.cool', 'archive.cool',
+    ...     factor=None, chunksize=10_000_000, target_bins=tb,
+    ... )
+    >>> clr = cooler.Cooler('archive.cool')
+    >>> clr.bins()[:]
+    >>> clr.info['bin-layout']        # 'sparse': an extension marker
+    >>> clr.extent('chr18')           # only the kept part of chr18 has bins
+
+Only source pixels whose *both* bins are retained take part; the others are
+dropped. ``count`` stays an exact integer. In symmetric-upper storage a
+contact that lands on a target pair is counted once -- including contacts
+that were off the diagonal but merge onto it. In square storage direction is
+kept and no transposes are added. The output keeps the source chromosome
+catalog and lengths, so the omitted regions are visible as empty ranges.
+
+The bins no longer tile their chromosomes, so the file carries the
+``bin-layout: sparse`` marker. It is an **extension** to the cooler format:
+this version of cooler reads it correctly, but other implementations may not.
+Ordinary ``create_cooler`` still requires a tiling bin table, so the default
+check is unchanged.
+
+Region queries follow the ragged layout
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+On a ragged layout -- and on any other non-uniform bin table that this version
+of cooler can open -- a genomic range selects the bins whose half-open interval
+*actually overlaps* it. A query that falls in a gap, before the first bin,
+after the last bin, on a chromosome with no bins, or that is empty
+(``start == end``) returns an empty range. A query that crosses a gap returns
+just the bins on either side that truly overlap it; it never reaches back to
+the previous bin or over to a neighbouring chromosome. ``fetch`` row/column
+IDs always agree with the equivalent integer slice of the matrix.
+
+On a fully tiled file the shortest-range semantics are unchanged.
+
+Dense, sparse and pixel outputs
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``matrix(..., sparse=False)`` and ``matrix(..., sparse=True)`` describe the
+same logical matrix, symmetrized for symmetric-upper storage. ``as_pixels``
+follows the existing convention and returns only the pixels *actually
+stored*: with symmetric-upper storage the lower triangle isn't generated, so
+a contact appears once, in the upper triangle. This is the same relationship
+as everywhere else in cooler: the dense/sparse matrix fills in the implicit
+lower triangle of the upper-triangular store, while the pixel output exposes
+the store itself.
+
+Named levels in a multires file
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:func:`cooler.zoomify_cooler` can write a set of explicitly binned levels
+under ``/bin_levels/<name>`` instead of integer-resolution MCOOL directories.
+Pass ``bin_levels`` (a mapping of level name to target table) and an empty
+``resolutions`` list; the two are mutually exclusive. Level names must start
+with an ASCII letter or digit and use only ASCII letters, digits, underscores
+and hyphens. Every table is validated against the *original* input first.
+
+.. code-block:: python
+
+    >>> fine = pd.DataFrame({'chrom': ['chr1', 'chr1'], 'start': [0, 50_000_000],
+    ...                      'end': [50_000_000, 100_000_000]})
+    >>> coarse = pd.DataFrame({'chrom': ['chr1'], 'start': [0], 'end': [100_000_000]})
+    >>> cooler.zoomify_cooler(
+    ...     'data/WT.DpnII.10kb.cool', 'archive.mcool',
+    ...     resolutions=[], chunksize=10_000_000,
+    ...     bin_levels={'fine': fine, 'coarse': coarse},
+    ... )
+
+A level is *reused* as the source for a coarser level only when the coarser
+level is exactly whole runs of the finer level's bins, with no needed source
+bin dropped. Then pooling target bins reproduces aggregating from the base
+exactly, for ``sum``, ``min`` and ``max``, and reads fewer pixels. If the
+coarser level needs a bin or a bin boundary the intermediate doesn't have, it
+is aggregated from the base. The choice depends only on the tables, not on
+the insertion order of the mapping, and the chosen sources are recorded in the
+``bin-level-sources`` file attribute.
+
+For the example above, ``coarse`` is exactly ``fine``'s two bins pooled, so it
+can be built from ``fine``. If instead ``fine`` split ``chr1`` at 30 Mb while
+``coarse`` wanted a single 0-50 Mb bin, that boundary falls *inside* one of
+``fine``'s bins, so no pooling of ``fine`` could reproduce it and ``coarse``
+must go back to the base. That is the trade-off: reusing an intermediate reads
+only that level's pixels and skips the more expensive source scan, but it is
+allowed only when it can't change the result.
+
 
 Create a scool file
 -------------------

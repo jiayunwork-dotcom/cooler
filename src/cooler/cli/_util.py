@@ -107,6 +107,57 @@ def parse_field_param(arg, includes_colnum=True, includes_agg=True, aggs=None):
     return name, colnum, dtype, agg
 
 
+def read_bed_target_bins(path):
+    """
+    Read a target bin table from a BED file.
+
+    Only the first three columns are read: ``chrom``, ``start`` and ``end``.
+    Blank lines and lines starting with ``#`` are ignored. Raises
+    :class:`click.BadParameter` if the file has fewer than three columns or
+    coordinates that can't be parsed as integers.
+
+    """
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+    except OSError as e:
+        raise click.BadParameter(f"Could not read '{path}': {e}") from e
+
+    chrom, start, end = [], [], []
+    for lineno, line in enumerate(lines, 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        fields = stripped.split("\t")
+        if len(fields) < 3:
+            # Fall back to whitespace for space-delimited BED-like files
+            fields = stripped.split()
+        if len(fields) < 3:
+            raise click.BadParameter(
+                f"{path}:{lineno}: expected at least 3 columns "
+                f"(chrom, start, end), found {len(fields)}."
+            )
+        try:
+            s = int(fields[1])
+            e = int(fields[2])
+        except ValueError as err:
+            raise click.BadParameter(
+                f"{path}:{lineno}: coordinates must be integers, got "
+                f"'{fields[1]}' and '{fields[2]}'."
+            ) from err
+        chrom.append(fields[0])
+        start.append(s)
+        end.append(e)
+
+    return pd.DataFrame(
+        {
+            "chrom": pd.Series(chrom, dtype=object),
+            "start": pd.Series(start, dtype=np.int64),
+            "end": pd.Series(end, dtype=np.int64),
+        }
+    )
+
+
 def fields_to_read(names, numbers):
     """
     Split input fields into the ones to read and the ones that copy another.

@@ -97,10 +97,14 @@ def _start_error_message() -> str:
     return msg
 
 
-def _init_worker(lock: Any) -> None:  # pragma: no cover (runs in workers)
+def _init_worker(
+    lock: Any, initializer: Callable | None = None, initargs: tuple = ()
+) -> None:  # pragma: no cover (runs in workers)
     # Workers started with spawn or forkserver don't inherit the parent's lock
     global _lock
     _lock = lock
+    if initializer is not None:
+        initializer(*initargs)
 
 
 def _noop() -> None:  # pragma: no cover (runs in workers)
@@ -122,11 +126,19 @@ class _ProcessPool:
     parent opens any more HDF5 files.
     """
 
-    def __init__(self, nproc: int, max_pending: int | None = None):
+    def __init__(
+        self,
+        nproc: int,
+        max_pending: int | None = None,
+        initializer: Callable | None = None,
+        initargs: tuple = (),
+    ):
         self.nproc = nproc
         self.max_pending = max_pending or 2 * nproc
         self._executor = ProcessPoolExecutor(
-            nproc, initializer=_init_worker, initargs=(get_lock(),)
+            nproc,
+            initializer=_init_worker,
+            initargs=(get_lock(), initializer, initargs),
         )
         try:
             self._executor.submit(_noop).result()

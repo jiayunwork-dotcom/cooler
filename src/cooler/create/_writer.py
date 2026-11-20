@@ -446,18 +446,81 @@ def _check_binsize(bins: pd.DataFrame, binsize: int) -> None:
         raise ValueError(f"The bins don't have a uniform size of {binsize}.")
 
 
+def _chrom_table(chromsizes: pd.Series | dict | None, bins: pd.DataFrame):
+    """The chrom table for a sparse bin layout: the given chromosome catalog."""
+    if chromsizes is None:
+        raise ValueError(
+            "A sparse bin layout needs the chromosome sizes: chromosome "
+            "lengths can't be inferred from a bin table with gaps."
+        )
+    if isinstance(chromsizes, dict):
+        names = list(chromsizes.keys())
+        lengths = list(chromsizes.values())
+    else:
+        names = list(chromsizes.index)
+        lengths = list(chromsizes.to_numpy())
+    if len(set(names)) != len(names):
+        raise ValueError("The chromosome sizes have duplicate names.")
+    lengths = np.asarray(lengths, dtype=np.int64)
+    if (lengths < 0).any():
+        raise ValueError("Chromosome lengths must not be negative.")
+    chroms = pd.DataFrame({"name": names, "length": lengths})
+    known = set(names)
+    used = set(pd.unique(np.asarray(bins["chrom"].astype(object))))
+    unknown = sorted(str(x) for x in used - known)
+    if unknown:
+        raise ValueError(f"Bins for chromosomes not in the chromsizes: {unknown}")
+    if len(bins):
+        lengths_of = dict(zip(names, lengths))
+        bin_lengths = np.array([lengths_of[x] for x in bins["chrom"].astype(object)])
+        over = bins["end"].to_numpy() > bin_lengths
+        if over.any():
+            i = int(np.argmax(over))
+            raise ValueError(
+                "A bin extends past its chromosome length: "
+                f"{bins['chrom'].iloc[i]}:{int(bins['start'].iloc[i])}-"
+                f"{int(bins['end'].iloc[i])} (length {int(bin_lengths[i])})."
+            )
+    return chroms
+
+
 def _prepare_tables(
-    bins: pd.DataFrame, binsize: int | None = None
+    bins: pd.DataFrame,
+    binsize: int | None = None,
+    chromsizes: pd.Series | dict | None = None,
+    sparse: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, Any]:
     """
     Return the bin table to write, the chrom table, and the bin size.
 
     A known bin size can be given, since it can't always be inferred from the
     table, e.g. when every chromosome is a single bin.
+
+    A ``sparse`` layout is an explicitly marked extension: the bins need not
+    tile the chromosomes, and the chrom table is taken from ``chromsizes``
+    rather than from the last kept bin of each chromosome.
     """
     for col in ["chrom", "start", "end"]:
         if col not in bins.columns:
             raise ValueError(f"Missing column from bin table: '{col}'.")
+    if sparse:
+        if len(bins):
+            starts = bins["start"].to_numpy()
+            ends = bins["end"].to_numpy()
+            if (ends <= starts).any():
+                raise ValueError(
+                    "The bin table has an empty or reversed bin: end must be "
+                    "greater than start."
+                )
+            if (starts < 0).any():
+                raise ValueError("The bin table has a negative start coordinate.")
+        chroms = _chrom_table(chromsizes, bins)
+        return bins, chroms, None
+    if chromsizes is not None:
+        raise ValueError(
+            "Explicit chromosome sizes are only accepted for a sparse bin "
+            "layout; ordinary bin tables must tile the chromosomes."
+        )
     _check_bins(bins)
     if binsize is None:
         binsize = get_binsize(bins)
@@ -549,6 +612,15 @@ class _CoolerWriter:
         Bin size of the bin table, if known. By default, it is inferred from
         the bin table, which isn't possible when every chromosome is a single
         bin.
+    chromsizes : pandas.Series or dict, optional
+        Chromosome sizes for an explicit sparse bin layout. When given (with
+        ``sparse=True``), the bin table need not tile the chromosomes and
+        chromosome lengths are taken from here, not from the last kept bin.
+    sparse : bool, optional
+        Mark the bin layout as sparse (an extension to the cooler format): the
+        bins may omit source bins, whole chromosomes, or be empty. The output
+        cooler's ``bin-layout`` attribute is set to ``"sparse"``. An ordinary
+        bin table must still tile the chromosomes.
 
     """
 
@@ -571,6 +643,8 @@ class _CoolerWriter:
         lock: Any | None = None,
         link_tables_from: str | None = None,
         binsize: int | None = None,
+        chromsizes: pd.Series | dict | None = None,
+        sparse: bool = False,
     ):
         file_path, group_path = parse_cooler_uri(cool_uri)
         self.file_path = op.realpath(file_path)
@@ -591,7 +665,10 @@ class _CoolerWriter:
             raise ValueError(  # noqa: TRY004
                 "The bin table must be a pandas DataFrame."
             )
-        self.bins, self.chroms, self.binsize = _prepare_tables(bins, binsize)
+        self.sparse = sparse
+        self.bins, self.chroms, self.binsize = _prepare_tables(
+            bins, binsize, chromsizes=chromsizes, sparse=sparse
+        )
         self.n_bins = len(self.bins)
         self.columns, self.dtypes = _pixel_schema(columns, dtypes)
         self.h5opts = _set_h5opts(h5opts)
@@ -816,6 +893,10 @@ class _CoolerWriter:
             "sum": self.sum,
             "nnz": self.nnz,
         }
+        if self.sparse:
+            # An extension to the cooler format: bins need not tile the
+            # chromosomes. Mark it so that readers can tell the difference.
+            info["bin-layout"] = "sparse"
         if self.assembly is not None:
             info["genome-assembly"] = self.assembly
         if self.metadata is not None:
@@ -948,7 +1029,14 @@ class _UnorderedCoolerWriter:
             self.merge_agg[_OCCURRENCES] = "sum"
         self.run_kwargs = {
             key: kwargs[key]
-            for key in ("symmetric_upper", "h5opts", "boundscheck", "triucheck")
+            for key in (
+                "symmetric_upper",
+                "h5opts",
+                "boundscheck",
+                "triucheck",
+                "chromsizes",
+                "sparse",
+            )
             if key in kwargs
         }
         self.run_kwargs["dupcheck"] = duplicates == "error"

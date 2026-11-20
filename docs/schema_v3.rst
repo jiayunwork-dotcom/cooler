@@ -103,6 +103,29 @@ Because they measure the same quantity in the same units, the coordinate columns
 
 The :command:`cooler balance` command stores balancing weights in a column called ``weight`` by default. NaN values indicate genomic bins that were blacklisted during the balancing procedure.
 
+Sparse bin layouts (extension)
+------------------------------
+
+The cooler format proper requires the bins to *tile* each chromosome: consecutive bins touch, with no gaps. Cooler 0.12.1 adds an opt-in **extension** that lets a bin table omit bins, whole chromosomes, or be empty, to archive a selected, possibly ragged set of genomic intervals (see :func:`cooler.coarsen_cooler`).
+
+.. warning::
+
+   This is an extension to the format. Files that use it are marked with the metadata attribute ``bin-layout`` (below), and are read correctly by this version of cooler. Other cooler implementations may not interpret them correctly, so don't rely on compatibility for files you didn't write with this extension.
+
+A sparse-layout data collection satisfies the ordinary schema except that:
+
+* the ``bins`` table need not start at 0, need not be contiguous, and may skip chromosomes entirely; each bin is still a non-empty, forward interval ``[start, end)`` with ``end`` <= the chromosome length;
+* ``chroms`` is the full chromosome catalog of the source, with the original lengths, so a chromosome with no bins still appears there and its ``chrom_offset`` entries are equal;
+* ``bin-type`` is ``"variable"`` and ``bin-size`` is ``"null"``, so clients use the variable-bin code path;
+* a metadata attribute ``bin-layout`` is set to ``"sparse"``.
+
+Region queries on a sparse-layout table select the bins whose half-open interval actually overlaps the query. A query in a gap, before the first bin, after the last bin, on a chromosome without bins, or a zero-length query selects an empty range. A query spanning a gap selects only the bins on either side that really overlap it. The same rule is applied to any *other* non-uniform bin table that this version of cooler can open.
+
+.. describe:: bin-layout : "sparse"
+
+    Optional. Marks the bin table as a sparse-layout extension (gaps allowed). Absent for ordinary, tiling bin tables.
+
+
 pixels
 ------
 
@@ -271,6 +294,40 @@ In addition, a multi-resolution cooler file may indicate to clients that it is u
 .. describe:: bin-type : { "fixed", "variable" }
 
     Indicates whether the resolution is constant along both axes.
+
+
+Named bin levels (extension)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:func:`cooler.zoomify_cooler` can store an explicit set of named, possibly
+sparse bin levels under ``/bin_levels/<name>`` instead of integer-resolution
+MCOOL directories. This is another extension, not part of the MCOOL layout,
+and it does **not** set the ``resolutions`` group. Each level is an ordinary
+(or sparse-layout) data collection; clients that only understand MCOOL won't
+find it, which is deliberate: these levels are not integer resolutions.
+
+::
+
+  XYZ.levels.mcool
+  /
+   └── bin_levels
+       ├── H1-hindIII
+       │   ├── bins
+       │   ├── chroms
+       │   ├── pixels
+       │   └── indexes
+       └── H1-hindIII-1Mb
+           ├── bins
+           ├── chroms
+           ├── pixels
+           └── indexes
+
+Level names start with an ASCII letter or digit and contain only ASCII
+letters, digits, underscores and hyphens. The root group carries two
+attributes: ``bin-levels`` (a JSON list of the level names, sorted) and
+``bin-level-sources`` (a JSON object mapping each level to the level it was
+aggregated from, or ``"base"``). Neither depends on the insertion order of
+the mapping passed to :func:`cooler.zoomify_cooler`.
 
 
 .. note::

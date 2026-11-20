@@ -26,6 +26,7 @@ __all__ = ["cp", "is_cooler", "is_multires_file", "list_coolers", "ln", "mv"]
 # "format-version" that older versions of cooler stored as strings.
 TEXT_ATTRS = frozenset(
     {
+        "bin-layout",
         "bin-type",
         "creation-date",
         "format",

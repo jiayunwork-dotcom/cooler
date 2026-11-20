@@ -6,7 +6,7 @@ from .._reduce import _AGGS, coarsen_cooler
 from ..parallel import get_lock
 from ..util import parse_cooler_uri
 from . import cli
-from ._util import parse_field_param
+from ._util import parse_field_param, read_bed_target_bins
 
 
 @cli.command()
@@ -17,8 +17,17 @@ from ._util import parse_field_param
     help="Gridding factor. The contact matrix is coarsegrained by grouping "
     "each chromosomal contact block into k-by-k element tiles",
     type=click.IntRange(min=2),
-    default=2,
-    show_default=True,
+    default=None,
+    show_default=False,
+)
+@click.option(
+    "--target-bins",
+    help="BED file of explicit target bins (chrom, start, end): only the "
+    "first three columns are used. Blank lines and lines starting with '#' "
+    "are ignored. Each interval must be a run of whole source bins. Mutually "
+    "exclusive with --factor.",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
 )
 @click.option(
     "--nproc",
@@ -56,12 +65,16 @@ from ._util import parse_field_param
     help="Pass this flag to append the output cooler to an existing file "
     "instead of overwriting the file.",
 )
-def coarsen(cool_uri, factor, nproc, chunksize, field, out, append):
+def coarsen(cool_uri, factor, target_bins, nproc, chunksize, field, out, append):
     """
     Coarsen a cooler to a lower resolution.
 
     Works by pooling *k*-by-*k* neighborhoods of pixels and aggregating.
     Each chromosomal block is coarsened individually.
+
+    Alternatively, pass --target-bins to pool an explicit, possibly sparse
+    set of intervals of whole source bins. The resulting cooler carries the
+    ``bin-layout: sparse`` extension marker.
 
     COOL_PATH : Path to a COOL file or Cooler URI.
 
@@ -69,6 +82,16 @@ def coarsen(cool_uri, factor, nproc, chunksize, field, out, append):
     infile, _ = parse_cooler_uri(cool_uri)
     outfile, _ = parse_cooler_uri(out)
     same_file = op.realpath(infile) == op.realpath(outfile)
+
+    if target_bins is not None and factor is not None:
+        raise click.UsageError("--target-bins and --factor are mutually exclusive.")
+    if target_bins is None and factor is None:
+        # Preserve the historical default factor
+        factor = 2
+    if target_bins is not None:
+        bins = read_bed_target_bins(target_bins)
+    else:
+        bins = None
 
     if len(field):
         field_specifiers = [
@@ -82,15 +105,20 @@ def coarsen(cool_uri, factor, nproc, chunksize, field, out, append):
         # Default aggregation. Dtype will be inferred.
         columns, dtypes, agg = ["count"], None, None
 
-    coarsen_cooler(
-        cool_uri,
-        out,
-        factor,
-        chunksize=chunksize,
-        nproc=nproc,
-        columns=columns,
-        dtypes=dtypes,
-        agg=agg,
-        lock=get_lock() if same_file else None,
-        mode="a" if append else "w",
-    )
+    try:
+        coarsen_cooler(
+            cool_uri,
+            out,
+            factor,
+            chunksize=chunksize,
+            nproc=nproc,
+            columns=columns,
+            dtypes=dtypes,
+            agg=agg,
+            target_bins=bins,
+            lock=get_lock() if same_file else None,
+            mode="a" if append else "w",
+        )
+    except ValueError as e:
+        # e.g. invalid target bins, unsupported aggregation, bad factor
+        raise click.ClickException(str(e)) from e

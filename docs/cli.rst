@@ -649,6 +649,10 @@ Coarsen a cooler to a lower resolution.
 Works by pooling *k*-by-*k* neighborhoods of pixels and aggregating.
 Each chromosomal block is coarsened individually.
 
+Alternatively, pass --target-bins to pool an explicit, possibly sparse
+set of intervals of whole source bins. The resulting cooler carries the
+``bin-layout: sparse`` extension marker.
+
 COOL_PATH : Path to a COOL file or Cooler URI.
 
 
@@ -667,7 +671,11 @@ COOL_PATH : Path to a COOL file or Cooler URI.
 
 .. option:: -k, --factor <factor>
 
-    Gridding factor. The contact matrix is coarsegrained by grouping each chromosomal contact block into k-by-k element tiles  [default: 2]
+    Gridding factor. The contact matrix is coarsegrained by grouping each chromosomal contact block into k-by-k element tiles
+
+.. option:: --target-bins <target_bins>
+
+    BED file of explicit target bins (chrom, start, end): only the first three columns are used. Blank lines and lines starting with '#' are ignored. Each interval must be a run of whole source bins. Mutually exclusive with --factor.
 
 .. option:: -n, -p, --nproc <nproc>
 
@@ -737,6 +745,10 @@ COOL_PATH : Path to a COOL file or Cooler URI.
 .. option:: -i, --base-uri <base_uri>
 
     One or more additional base coolers to aggregate from, if needed.
+
+.. option:: --bin-level <bin_level>
+
+    Explicit bin level as '<name>=<BED file>': the BED file contains chrom, start and end in its first three columns (blank lines and '#' comments are ignored). Repeat the option for each level. Level names must start with an ASCII letter or digit and contain only ASCII letters, digits, underscores and hyphens. Levels are stored under /bin_levels/<name> and mutually exclusive with --resolutions.
 
 .. option:: -o, --out <out>
 

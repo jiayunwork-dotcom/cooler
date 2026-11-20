@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os.path as op
 import warnings
 from bisect import bisect_right
@@ -11,7 +12,9 @@ import h5py
 import numpy as np
 import pandas as pd
 
+from ._aggregate import TargetAggregator
 from ._logging import get_logger
+from ._targets import TargetBins, check_level_name, read_source_bins
 from ._typing import MapFunctor
 from ._version import __format_version_mcool__
 from .api import Cooler
@@ -618,15 +621,50 @@ class CoolerCoarsener(ContactBinner):
                 yield {k: v.values for k, v in df.items()}
 
 
+class CoolerTargetCoarsener(ContactBinner):
+    """
+    Implementation of coarsening onto an explicit target bin table.
+
+    Yields target pixels sorted by (bin1_id, bin2_id) with no duplicates,
+    aggregating only source pixels whose both bins are retained.
+    """
+
+    def __init__(
+        self,
+        source_uri: str,
+        target: TargetBins,
+        chunksize: int,
+        columns: list[str],
+        agg: dict[str, Any] | None,
+        nproc: int = 1,
+    ):
+        self.source_uri = source_uri
+        self.target = target
+        self.chunksize = int(chunksize)
+        self.columns = list(columns)
+        self.aggregator = TargetAggregator(
+            source_uri,
+            target,
+            columns=self.columns,
+            agg=_value_aggs(self.columns, agg),
+            chunksize=self.chunksize,
+            nproc=nproc,
+        )
+
+    def __iter__(self) -> Iterator[dict[str, np.ndarray]]:
+        yield from self.aggregator
+
+
 def coarsen_cooler(
     base_uri: str,
     output_uri: str,
-    factor: int,
+    factor: int | None,
     chunksize: int,
     nproc: int = 1,
     columns: list[str] | None = None,
     dtypes: dict[str, Any] | None = None,
     agg: dict[str, Any] | None = None,
+    target_bins: pd.DataFrame | None = None,
     **kwargs,
 ) -> None:
     """
@@ -636,6 +674,13 @@ def coarsen_cooler(
     Each chromosomal block is coarsened individually. Result is a coarsened
     cooler stored at ``output_uri``.
 
+    Alternatively, pass ``target_bins`` to pool an arbitrary, possibly sparse
+    set of intervals of whole source bins: each target bin becomes an output
+    bin, in the row order of the table, and only source pixels whose both
+    bins are retained contribute.  The output is marked with the ``bin-layout``
+    attribute ``"sparse"``, an extension to the cooler format that other
+    implementations may not interpret; see Notes.
+
     .. versionadded:: 0.8.0
 
     Parameters
@@ -644,10 +689,11 @@ def coarsen_cooler(
         Input cooler file path or URI.
     output_uri : str
         Input cooler file path or URI.
-    factor : int
-        Coarsening factor.
+    factor : int or None
+        Coarsening factor. Must be ``None`` when ``target_bins`` is given.
     chunksize : int
-        Number of pixels processed at a time per worker.
+        Number of source pixels processed at a time per worker. It bounds the
+        pixels read at once; it is not widened to cover a whole target bin.
     nproc : int, optional
         Number of workers for batch processing of pixels. Default is 1,
         i.e. no process pool.
@@ -658,11 +704,35 @@ def coarsen_cooler(
         Specific dtypes to use for value columns. Default is to propagate
         the current dtypes of the value columns.
     agg : dict, optional
-        How to combine the pixels of each *k*-by-*k* block: a mapping of value
-        column names to "sum" (default), "min" or "max". Pixels that aren't
-        stored don't contribute a value.
+        How to combine the pixels of each *k*-by-*k* block (or target bin): a
+        mapping of value column names to "sum" (default), "min" or "max".
+        Pixels that aren't stored don't contribute a value.
+    target_bins : pandas.DataFrame, optional
+        An explicit target bin table with columns ``chrom``, ``start`` and
+        ``end``, sorted by input chromosome catalog order then start. Each
+        interval must be non-empty, must not overlap another, and must be
+        exactly a run of consecutive source bins on one chromosome: target
+        bins can't split a source bin or cover coordinates the source lacks.
+        Source bins and whole chromosomes may be omitted; a zero-row table is
+        allowed. The output keeps the source chromosome catalog and lengths.
+        The table's row order defines the output bin IDs; every retained
+        source bin belongs to exactly one target bin. Source pixel value
+        columns such as ``weight`` in the bin table are not copied.
     kwargs
         Passed to ``cooler.create``.
+
+    Notes
+    -----
+    The sparse target layout is an extension to the cooler format. Output
+    files carry ``bin-layout: sparse`` and remain readable by this version of
+    cooler, but other cooler implementations may not interpret them
+    correctly.
+
+    Only source pixels with both bins retained take part; the rest are
+    dropped. ``count`` stays an exact integer. A pixel landing on a target
+    pair is counted once in symmetric-upper storage, including contacts that
+    were off the diagonal but merge onto it; square storage keeps direction
+    and doesn't add transposes or combine reverse records.
 
     See also
     --------
@@ -672,16 +742,28 @@ def coarsen_cooler(
     """
     # TODO: decide whether to default to 'count' or whatever is there besides
     # bin1_id, bin2_id dtypes = dict(clr.pixels().dtypes.drop(['bin1_id', 'bin2_id']))
+    if target_bins is not None and factor is not None:
+        raise ValueError(
+            "Pass either an integer factor or an explicit target_bins table, "
+            "not both."
+        )
+    if target_bins is None and factor is None:
+        raise ValueError("Either factor or target_bins must be given.")
+
     clr = Cooler(base_uri)
 
-    factor = int(factor)
-    if factor < 2:
-        raise ValueError(f"The coarsening factor must be at least 2, not {factor}.")
+    if factor is not None:
+        factor = int(factor)
+        if factor < 2:
+            raise ValueError(
+                f"The coarsening factor must be at least 2, not {factor}."
+            )
 
     if columns is None:
         columns = ["count"]
 
     dtypes = {} if dtypes is None else dict(dtypes)
+    explicit_dtypes = set(dtypes)
 
     input_dtypes = clr.pixels().dtypes
     for col in columns:
@@ -692,12 +774,64 @@ def coarsen_cooler(
         else:
             dtypes.setdefault(col, input_dtypes[col])
 
-    try:
-        # Note: fork before opening to prevent inconsistent global HDF5 state
+    # Validate the target table before anything is written
+    target = None
+    if target_bins is not None:
+        target = TargetBins.from_frame(
+            target_bins,
+            clr.chromsizes,
+            read_source_bins(clr),
+        )
+        # Keep summed integers exact. Unless the caller asked for a specific
+        # dtype, pool integer `sum` columns into int64 and float columns into
+        # float64 (which also avoids overflowing the source's int32 counts).
+        aggs_by_col = _value_aggs(columns, agg)
+        for col in columns:
+            if col in explicit_dtypes:
+                continue
+            kind = np.dtype(input_dtypes[col]).kind
+            if kind in "iub":
+                dtypes[col] = np.dtype(
+                    np.int64 if aggs_by_col.get(col, "sum") == "sum" else kind
+                )
+            elif kind == "f" and aggs_by_col.get(col, "sum") == "sum":
+                dtypes[col] = np.dtype(np.float64)
+
+    if target is not None:
+        # The target coarsener manages its own workers (and their reader
+        # state); no second pool is created here.
+        iterator = CoolerTargetCoarsener(
+            base_uri,
+            target,
+            chunksize,
+            columns=columns,
+            agg=agg,
+            nproc=nproc,
+        )
+        new_bins = target.bins
+        create_kwargs = {"chromsizes": target.chromsizes, "sparse": True}
         if nproc > 1:
             kwargs.setdefault("lock", get_lock())
-            pool = _ProcessPool(nproc)
+        kwargs.setdefault("mode", "a")
+        kwargs.setdefault("assembly", clr.info.get("genome-assembly"))
+        kwargs.setdefault("metadata", clr.info.get("metadata"))
+        create(
+            output_uri,
+            new_bins,
+            iterator,
+            columns=columns,
+            dtypes=dtypes,
+            symmetric_upper=clr.storage_mode == "symmetric-upper",
+            binsize=None,
+            **create_kwargs,
+            **kwargs,
+        )
+        return
 
+    if nproc > 1:
+        kwargs.setdefault("lock", get_lock())
+        pool = _ProcessPool(nproc)
+    try:
         iterator = CoolerCoarsener(
             base_uri,
             factor,
@@ -707,7 +841,6 @@ def coarsen_cooler(
             batchsize=nproc,
             map=pool.map if nproc > 1 else map,
         )
-
         new_bins = iterator.new_bins
 
         kwargs.setdefault("mode", "a")
@@ -733,12 +866,13 @@ def coarsen_cooler(
 def zoomify_cooler(
     base_uris: str | list[str],
     outfile: str,
-    resolutions: list[int],
+    resolutions: list[int] | None,
     chunksize: int,
     nproc: int = 1,
     columns: list[str] | None = None,
     dtypes: dict[str, Any] | None = None,
     agg: dict[str, Any] | None = None,
+    bin_levels: dict[str, pd.DataFrame] | None = None,
     **kwargs,
 ) -> None:
     """
@@ -747,6 +881,11 @@ def zoomify_cooler(
     Result is a "zoomified" or "multires" cool file stored at ``outfile``
     using the MCOOL v2 layout, where coolers are stored under a hierarchy of
     the form ``resolutions/<r>`` for each resolution ``r``.
+
+    Alternatively, pass ``bin_levels`` to store explicitly binned, possibly
+    sparse, levels under ``/bin_levels/<name>`` instead.  This is an extension
+    to the MCOOL layout: the levels keep their names rather than pretending to
+    be integer resolutions, and ``resolutions`` must be empty.
 
     .. versionadded:: 0.8.0
 
@@ -757,7 +896,8 @@ def zoomify_cooler(
     outfile : str
         Output multires cooler (mcool) file path.
     resolutions : list of int
-        A list of target resolutions to generate.
+        A list of target resolutions to generate. Mutually exclusive with
+        ``bin_levels``. May be empty only when ``bin_levels`` is given.
     chunksize : int
         Number of pixels processed at a time per worker.
     nproc : int, optional
@@ -774,8 +914,26 @@ def zoomify_cooler(
         value column names to "sum" (default), "min" or "max". These give the
         same result whether a resolution is coarsened from the base or from
         the previous resolution.
+    bin_levels : dict of str to pandas.DataFrame, optional
+        Explicit target bin tables, keyed by level name. Keys must start with
+        an ASCII letter or digit and contain only ASCII letters, digits,
+        underscores and hyphens. Each table follows the same rules as
+        ``coarsen_cooler``'s ``target_bins``. Each level is stored under
+        ``/bin_levels/<name>``; levels may be unrelated to one another or be
+        coarser merges of another level. Every table is validated against the
+        original input first.
     kwargs
         Passed to ``cooler.create``.
+
+    Notes
+    -----
+    The explicit-level mode accepts a single base URI for now. A level may be
+    aggregated directly from the base, or, when it can be built purely by
+    pooling whole target bins of another level, from that level; in either
+    case the result is identical to aggregating from the base. A level whose
+    needed bins or bin boundaries are missing from an intermediate level is
+    always aggregated from the base. The insertion order of ``bin_levels``
+    doesn't change any level's result.
 
     See also
     --------
@@ -783,6 +941,21 @@ def zoomify_cooler(
     cooler.merge_coolers
 
     """
+    if bin_levels is not None:
+        _zoomify_bin_levels(
+            base_uris,
+            outfile,
+            bin_levels,
+            resolutions,
+            chunksize,
+            nproc=nproc,
+            columns=columns,
+            dtypes=dtypes,
+            agg=agg,
+            **kwargs,
+        )
+        return
+
     # TODO: provide presets? {'pow2', '4dn'}
     if isinstance(base_uris, str):
         base_uris = [base_uris]
@@ -863,3 +1036,164 @@ def zoomify_cooler(
         fw.attrs.update(
             {"format": "HDF5::MCOOL", "format-version": __format_version_mcool__}
         )
+
+
+def _zoomify_bin_levels(
+    base_uris,
+    outfile,
+    bin_levels,
+    resolutions,
+    chunksize,
+    nproc=1,
+    columns=None,
+    dtypes=None,
+    agg=None,
+    **kwargs,
+):
+    """Write explicit bin levels under ``/bin_levels/<name>``."""
+    if resolutions:
+        raise ValueError(
+            "Pass either integer resolutions or explicit bin_levels, not both."
+        )
+    if isinstance(base_uris, str):
+        base_uris = [base_uris]
+    base_uris = list(base_uris)
+    if len(base_uris) != 1:
+        raise ValueError(
+            "Explicit bin levels support a single base URI for now, not "
+            f"{len(base_uris)}."
+        )
+    if not isinstance(bin_levels, dict):
+        raise ValueError(  # noqa: TRY004
+            "bin_levels must be a dict mapping level names to target bin "
+            "DataFrames."
+        )
+    names = []
+    for name in bin_levels:
+        check_level_name(name)
+        names.append(name)
+    if len(set(names)) != len(names):
+        raise ValueError("bin_levels has duplicate level names.")
+
+    base_uri = base_uris[0]
+    infile, ingroup = parse_cooler_uri(base_uri)
+    if op.exists(outfile) and op.samefile(infile, outfile):
+        raise ValueError(
+            f"The output file '{outfile}' contains the input '{base_uri}'."
+        )
+    base = Cooler(infile, ingroup)
+    if columns is None:
+        columns = ["count"]
+    input_dtypes = base.pixels().dtypes
+    for col in columns:
+        if col not in input_dtypes:
+            raise ValueError(
+                f"Pixel value column '{col}' not found in input "
+                f"'{base.filename}'."
+            )
+    dtypes = {} if dtypes is None else dict(dtypes)
+    # Only the caller's explicit dtypes are forwarded; otherwise each level
+    # picks exact accumulation dtypes in coarsen_cooler.
+
+    # Validate every table against the original input before writing anything
+    src_bins = read_source_bins(base)
+    targets = {
+        name: TargetBins.from_frame(bin_levels[name], base.chromsizes, src_bins)
+        for name in names
+    }
+
+    # Choose a source for each level. A level may be built from another level
+    # only if its target bins are exactly whole runs of that level's bins and
+    # no needed bin was dropped; then pooling is exact for sum, min and max,
+    # and reads fewer pixels. Otherwise it is aggregated from the base.
+    #
+    # To keep the choice independent of dict insertion order and to avoid
+    # cycles, process levels from finest to coarsest: a level can only use an
+    # already-written finer level. "Finer" means it has more target bins (a
+    # derivable level has at least as many), so sort descending by bin count.
+    rank = {
+        name: (-targets[name].nbins, -_n_retained(targets[name]), name)
+        for name in names
+    }
+    ordered = sorted(names, key=lambda n: rank[n])
+    parent: dict[str, str | None] = {}
+    for i, name in enumerate(ordered):
+        chosen = None
+        best_key = None
+        # Prefer the fitting level that stores the fewest pixels: it reads
+        # less. That is the coarsest fitting level.
+        for candidate in ordered[:i]:
+            pooled = targets[name].derives_from(targets[candidate])
+            if pooled is None:
+                continue
+            key = (_level_nnz(base, targets, candidate), rank[candidate])
+            if best_key is None or key < best_key:
+                best_key = key
+                chosen = candidate
+        parent[name] = chosen
+
+    logger.info(
+        f"Writing {len(names)} explicit bin levels: "
+        + ", ".join(
+            f"{name} (from {parent[name] if parent[name] else 'base'})"
+            for name in names
+        )
+    )
+
+    with h5py.File(outfile, "w"):
+        pass
+
+    for name in ordered:
+        source = parent[name]
+        spec = dict(
+            chunksize=chunksize,
+            nproc=nproc,
+            columns=columns,
+            dtypes=dtypes,
+            agg=agg,
+            mode="a",
+            **kwargs,
+        )
+        spec.setdefault("lock", get_lock())
+        if source is None:
+            pool_target = targets[name]
+            source_uri = base_uri
+        else:
+            pool_target = targets[name].derives_from(targets[source])
+            source_uri = outfile + "::/bin_levels/" + source
+        coarsen_cooler(
+            source_uri,
+            outfile + "::/bin_levels/" + name,
+            None,
+            target_bins=pool_target.bins,
+            **spec,
+        )
+
+    with h5py.File(outfile, "r+") as fw:
+        fw.attrs.update(
+            {
+                "format": "HDF5::MCOOL",
+                "format-version": __format_version_mcool__,
+                # Level names, sorted, so the listing doesn't depend on the
+                # insertion order of the mapping
+                "bin-levels": json.dumps(sorted(names)),
+                # Which source each level was aggregated from ("base" or a
+                # level name), for inspection.
+                "bin-level-sources": json.dumps(
+                    {name: (parent[name] or "base") for name in sorted(names)}
+                ),
+            }
+        )
+
+
+def _n_retained(target: TargetBins) -> int:
+    return int((target.src_to_tgt >= 0).sum())
+
+
+def _level_nnz(base, targets, candidate) -> int:
+    """A cheap upper bound on the pixels a level stores."""
+    # A level stores at most as many pixels as the base rows it retains; use
+    # its retained fraction of the base's nnz as an estimate.
+    nnz = base.info.get("nnz", 0)
+    n = len(targets[candidate].src_to_tgt)
+    return int(nnz * _n_retained(targets[candidate]) / max(n, 1))

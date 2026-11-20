@@ -15,7 +15,7 @@ from .._reduce import (
 from ..parallel import get_lock
 from ..util import parse_cooler_uri
 from . import cli, get_logger
-from ._util import parse_field_param
+from ._util import parse_field_param, read_bed_target_bins
 
 
 def invoke_balance(args, resolutions, outfile):
@@ -99,6 +99,17 @@ def invoke_balance(args, resolutions, outfile):
 )
 @click.option("--out", "-o", help="Output file or URI")
 @click.option(
+    "--bin-level",
+    help="Explicit bin level as '<name>=<BED file>': the BED file contains "
+    "chrom, start and end in its first three columns (blank lines and '#' "
+    "comments are ignored). Repeat the option for each level. Level names "
+    "must start with an ASCII letter or digit and contain only ASCII "
+    "letters, digits, underscores and hyphens. Levels are stored under "
+    "/bin_levels/<name> and mutually exclusive with --resolutions.",
+    type=str,
+    multiple=True,
+)
+@click.option(
     "--field",
     help="Specify the names of value columns to merge as '<name>'. "
     "Repeat the `--field` option for each one. Append ':' and "
@@ -117,6 +128,7 @@ def zoomify(
     balance_args,
     field,
     base_uri,
+    bin_level,
     out,
 ):
     """
@@ -162,6 +174,75 @@ def zoomify(
         mean_fragsize = (bins["end"] - bins["start"]).mean()
         maxres = ceil(genome_length / mean_fragsize / HIGLASS_TILE_DIM)
         curres = 1
+
+    # Explicit bin levels (possibly sparse) under /bin_levels/<name>
+    if bin_level:
+        if resolutions is not None:
+            raise click.UsageError(
+                "--bin-level and --resolutions are mutually exclusive."
+            )
+        levels = {}
+        for item in bin_level:
+            if "=" not in item:
+                raise click.BadParameter(
+                    f"Expected '<name>=<BED file>', got '{item}'.",
+                    param_hint="'--bin-level'",
+                )
+            name, path = item.split("=", 1)
+            name = name.strip()
+            if not name:
+                raise click.BadParameter(
+                    f"Missing level name in '{item}'.", param_hint="'--bin-level'"
+                )
+            if name in levels:
+                raise click.BadParameter(
+                    f"Duplicate bin level name '{name}'.", param_hint="'--bin-level'"
+                )
+            levels[name] = read_bed_target_bins(path)
+
+        if len(field):
+            field_specifiers = [
+                parse_field_param(arg, includes_colnum=False, aggs=_AGGS)
+                for arg in field
+            ]
+            columns, _, dtypes, agg = zip(*field_specifiers)
+            columns = list(columns)
+            dtypes = {col: dt for col, dt in zip(columns, dtypes) if dt is not None}
+            agg = {col: f for col, f in zip(columns, agg) if f is not None}
+        else:
+            columns, dtypes, agg = ["count"], None, None
+
+        try:
+            zoomify_cooler(
+                [cool_uri, *list(base_uri)],
+                outfile,
+                [],
+                chunksize,
+                nproc=nproc,
+                columns=columns,
+                dtypes=dtypes,
+                agg=agg,
+                bin_levels=levels,
+            )
+        except ValueError as e:
+            raise click.ClickException(str(e)) from e
+
+        if balance:
+            from .balance import balance as balance_cmd
+
+            for name in fileops.list_coolers(outfile):
+                if not name.startswith("/bin_levels/"):
+                    continue
+                args = shlex.split(balance_args) if balance_args else []
+                uri = outfile + "::" + name
+                ctx = balance_cmd.make_context(
+                    "balance", [uri, *args], resilient_parsing=True
+                )
+                weight = ctx.params.get("name") or "weight"
+                if weight in api.Cooler(uri).bins() and not ctx.params.get("force"):
+                    continue
+                balance_cmd.main(args=[uri, *args], prog_name="cooler")
+        return
 
     # Default is to use a binary geometric progression
     if resolutions is None:

@@ -123,6 +123,8 @@ def create(
     ensure_sorted=False,
     lock=None,
     binsize=None,
+    chromsizes=None,
+    sparse=False,
     **kwargs,
 ):
     """
@@ -131,6 +133,12 @@ def create(
     ``binsize`` is the bin size of the bin table, if known. By default, it is
     inferred from the bin table, which isn't possible when every chromosome is
     a single bin.
+
+    ``chromsizes`` and ``sparse`` request an explicit sparse bin layout, an
+    extension to the cooler format in which the bins need not tile the
+    chromosomes (see :class:`cooler._targets.TargetBins`). ``chromsizes`` is
+    required then, since chromosome lengths can't be inferred from the bins.
+    Ordinary bin tables must still tile the chromosomes.
 
     Deprecated parameters
     ---------------------
@@ -195,6 +203,8 @@ def create(
         ensure_sorted=ensure_sorted,
         lock=lock,
         binsize=binsize,
+        chromsizes=chromsizes,
+        sparse=sparse,
     )
     with writer:
         logger.info("Writing pixels")
@@ -380,6 +390,8 @@ def create_cooler(
     ensure_sorted: bool = False,
     h5opts: dict | None = None,
     lock: Any | None = None,
+    chromsizes: pd.Series | dict | None = None,
+    sparse: bool = False,
 ) -> None:
     r"""
     Create a cooler from bins and pixels at the specified URI.
@@ -444,6 +456,8 @@ def create_cooler(
             ensure_sorted=ensure_sorted,
             h5opts=h5opts,
             lock=lock,
+            chromsizes=chromsizes,
+            sparse=sparse,
         )
     else:
         create_from_unordered(
@@ -468,6 +482,8 @@ def create_cooler(
             max_merge=max_merge,
             agg=agg,
             duplicates=duplicates,
+            chromsizes=chromsizes,
+            sparse=sparse,
         )
 
 

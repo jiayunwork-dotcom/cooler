@@ -478,14 +478,28 @@ def bedslice(
     """
     Range query on a BED-like dataframe with non-overlapping intervals.
 
+    Returns the rows whose half-open intervals actually overlap the query,
+    which is empty for a region in a gap, before the first interval or after
+    the last one, and for an empty query.
+
     """
     chrom, start, end = parse_region(region, chromsizes)
+    if chrom not in grouped.groups:
+        return grouped.obj.iloc[0:0]
     result = grouped.get_group(chrom)
-    if start > 0 or end < chromsizes[chrom]:
-        lo = result["end"].values.searchsorted(start, side="right")
-        hi = lo + result["start"].values[lo:].searchsorted(end, side="left")
-        result = result.iloc[lo:hi]
-    return result
+    return _overlapping(result, start, end)
+
+
+def _overlapping(result: pd.DataFrame, start: int, end: int) -> pd.DataFrame:
+    """Rows of a sorted, non-overlapping BED-like table overlapping [start, end)."""
+    if end <= start or len(result) == 0:
+        return result.iloc[0:0]
+    ends = result["end"].to_numpy()
+    starts = result["start"].to_numpy()
+    # First row whose end is after start; first row whose start is >= end
+    lo = int(np.searchsorted(ends, start, side="right"))
+    hi = int(np.searchsorted(starts, end, side="left"))
+    return result.iloc[lo : max(lo, hi)]
 
 
 def asarray_or_dataset(x: Any) -> np.ndarray | h5py.Dataset:
@@ -883,13 +897,18 @@ class GenomeSegmentation:
         )
 
     def fetch(self, region: GenomicRangeSpecifier) -> pd.DataFrame:
+        """
+        Bins whose half-open genomic intervals overlap ``region``.
+
+        A region in a gap between bins, before the first bin, after the last
+        bin, or on a contig without bins selects no rows, as does an empty
+        region.
+        """
         chrom, start, end = parse_region(region, self.chromsizes)
+        if chrom not in self._bins_grouped.groups:
+            return self.bins.iloc[0:0]
         result = self._bins_grouped.get_group(chrom)
-        if start > 0 or end < self.chromsizes[chrom]:
-            lo = result["end"].values.searchsorted(start, side="right")
-            hi = lo + result["start"].values[lo:].searchsorted(end, side="left")
-            result = result.iloc[lo:hi]
-        return result
+        return _overlapping(result, start, end)
 
 
 def buffered(
