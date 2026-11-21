@@ -238,7 +238,7 @@ To pipe input from stdin, set PAIRS_PATH to '-'.
 
 .. option:: --mergebuf <mergebuf>
 
-    Total number of pixel records to buffer per epoch of merging data. Defaults to the same value as `chunksize`.
+    Maximum number of source pixel records held in memory at a time while merging. This is a hard bound: wide matrix rows are split across read batches. Defaults to the same value as `chunksize`.
 
 .. option:: --max-merge <max_merge>
 
@@ -559,7 +559,7 @@ cooler load -f bg2 <chrom.sizes>:<binsize> in.bg2.gz out.cool
 
 .. option:: --mergebuf <mergebuf>
 
-    Total number of records to buffer per epoch of merging data. Defaults to the same value as `chunksize`.
+    Maximum number of source records held in memory at a time while merging. This is a hard bound: wide matrix rows are split across read batches. Defaults to the same value as `chunksize`.
 
 .. option:: --temp-dir <temp_dir>
 

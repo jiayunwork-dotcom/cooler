@@ -41,27 +41,21 @@ def test_merge(path1, path2):
         )
 
 
-@pytest.mark.parametrize("samples", [7, 200])
-def test_merge_sampled_index(monkeypatch, tmp_path, samples):
-    # Merges read every stride-th entry of the inputs' indexes when they're
-    # too large to read whole; the result must not change
+@pytest.mark.parametrize("mergebuf", [2, 3, 17, 5000])
+def test_merge_mergebuf_invariant(tmp_path, mergebuf):
+    # The merge buffer size must not change the merged result
     path = op.join(datadir, "hg19.GM12878-MboI.matrix.2000kb.cool")
-    merge_coolers(str(tmp_path / "full.cool"), [path, path], mergebuf=5000)
-    monkeypatch.setattr(cooler._reduce, "_MERGE_INDEX_SAMPLES", samples)
-    merge_coolers(str(tmp_path / "sampled.cool"), [path, path], mergebuf=5000)
-    cooler_cmp(str(tmp_path / "full.cool"), str(tmp_path / "sampled.cool"))
-    # Coarser epochs: a whole block of rows can't be split
-    with pytest.warns(UserWarning, match="a block of .* rows"):
-        merge_coolers(str(tmp_path / "x.cool"), [path, path], mergebuf=10)
+    merge_coolers(str(tmp_path / "ref.cool"), [path, path], mergebuf=5000)
+    merge_coolers(str(tmp_path / "out.cool"), [path, path], mergebuf=mergebuf)
+    cooler_cmp(str(tmp_path / "ref.cool"), str(tmp_path / "out.cool"))
 
 
 def test_merge2():
     with isolated_filesystem():
         path1 = op.join(datadir, "toy.symm.upper.2.cool")
         path2 = op.join(datadir, "toy.symm.upper.2.cool")
-        # Rows hold more pixels than mergebuf: they can't be split
-        with pytest.warns(UserWarning, match="more than mergebuf=3"):
-            merge_coolers("test.cool", [path1, path2], mergebuf=3, agg={"count": "max"})
+        # Rows hold more pixels than mergebuf: they are split across batches
+        merge_coolers("test.cool", [path1, path2], mergebuf=3, agg={"count": "max"})
         single = cooler.Cooler(path1)
         merged = cooler.Cooler("test.cool")
         assert merged.pixels()["count"][:].sum() == single.pixels()["count"][:].sum()

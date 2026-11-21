@@ -39,6 +39,91 @@ class BadInputError(ValueError):
     pass
 
 
+class IntegerOverflowError(OverflowError, ValueError):
+    """
+    An integer value can't be represented in the output dtype.
+
+    Raised instead of letting a sum wrap around, truncate, or be coerced to a
+    lossy float. It is also a ``ValueError`` for backward compatibility.
+    """
+
+
+_INT64_MIN = np.iinfo(np.int64).min
+_INT64_MAX = np.iinfo(np.int64).max
+_UINT64_MAX = np.iinfo(np.uint64).max
+
+
+def exact_column_sum(values: np.ndarray) -> int | float:
+    """
+    The exact sum of a 1D array of values.
+
+    Integer arrays are summed without overflow: the result is a Python
+    integer of arbitrary precision. Other dtypes (e.g. floats) keep the
+    usual numpy summation semantics.
+    """
+    arr = np.asarray(values)
+    if arr.dtype.kind not in "iub":
+        return arr.sum()
+    n = len(arr)
+    if n == 0:
+        return 0
+    lo, hi = int(arr.min()), int(arr.max())
+    if arr.dtype.kind == "u" or arr.dtype.kind == "b":
+        if hi * n <= _UINT64_MAX:
+            return int(arr.astype(np.uint64).sum())
+    elif _INT64_MIN <= lo * n and hi * n <= _INT64_MAX:
+        return int(arr.astype(np.int64).sum())
+    # Rare: values too large to prove the numpy sum can't wrap
+    return int(arr.astype(object).sum())
+
+
+def _group_sum_exact(df: pd.DataFrame, keys: list[str], col: str) -> pd.Series:
+    """
+    Grouped sum of an integer column, exact even where int64/uint64 wrap.
+
+    Falls back to summing Python integers when the column's range and the
+    batch size can't rule out overflow of the fast numpy summation.
+    """
+    s = df[col]
+    n = len(s)
+    kind = s.dtype.kind
+    if n and kind in "iub":
+        lo, hi = int(s.min()), int(s.max())
+        if kind in "ub":
+            if hi * n <= _UINT64_MAX:
+                return df.groupby(keys, sort=True)[col].sum()
+        elif _INT64_MIN <= lo * n and hi * n <= _INT64_MAX:
+            return df.groupby(keys, sort=True)[col].sum()
+        # Sum Python ints: exact at any magnitude
+        return df[col].astype(object).groupby([df[k] for k in keys], sort=True).sum()
+    return df.groupby(keys, sort=True)[col].sum()
+
+
+def groupby_agg_exact(
+    df: pd.DataFrame, keys: list[str], aggs: dict[str, Any]
+) -> pd.DataFrame:
+    """
+    Group ``df`` by ``keys`` and aggregate value columns with "sum", "min"
+    or "max". Integer sums are exact: they never wrap, truncate or become
+    floats. Columns whose sums needed arbitrary precision have dtype
+    ``object`` (holding Python ints); the caller decides whether they fit
+    the storage dtype.
+    """
+    if not len(df):
+        out = df[keys].copy()
+        for col in aggs:
+            out[col] = pd.Series(dtype=df[col].dtype)
+        return out
+    parts = []
+    for col, agg in aggs.items():
+        if agg == "sum" and df[col].dtype.kind in "iub":
+            s = _group_sum_exact(df, keys, col)
+        else:
+            s = getattr(df.groupby(keys, sort=True)[col], agg)()
+        parts.append(s.rename(col))
+    return pd.concat(parts, axis=1).reset_index()
+
+
 SANITIZE_PRESETS = {
     "bg2": {
         "decode_chroms": True,

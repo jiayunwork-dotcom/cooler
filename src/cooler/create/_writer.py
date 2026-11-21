@@ -33,7 +33,12 @@ from ._constants import (
     PIXEL_DTYPES,
     URL,
 )
-from ._ingest import BadInputError, _check_pixel_ids
+from ._ingest import (
+    BadInputError,
+    IntegerOverflowError,
+    _check_pixel_ids,
+    exact_column_sum,
+)
 
 logger = get_logger("cooler.create")
 
@@ -233,13 +238,15 @@ def write_bins(
 def prepare_pixels(
     grp: h5py.Group,
     n_bins: int,
-    max_size: int,
+    max_size: int | None,
     columns: pd.Index | list[str],
     dtypes: pd.Series | dict[str, Any],
     h5opts: dict,
 ) -> None:
     columns = list(columns)
-    init_size = min(5 * n_bins, max_size)
+    # max_size=None: unbounded, for temporary tables holding records that
+    # still await aggregation (they can outnumber the matrix triangle)
+    init_size = 5 * n_bins if max_size is None else min(5 * n_bins, max_size)
     grp.create_dataset(
         "bin1_id",
         dtype=dtypes.get("bin1_id", BIN_DTYPE),
@@ -285,16 +292,32 @@ def _check_fits_dtype(col: str, values: np.ndarray, dtype: np.dtype) -> None:
     """Raise if integer values would be clipped when stored as ``dtype``."""
     dtype = np.dtype(dtype)
     values = np.asarray(values)
-    if dtype.kind not in "iu" or values.dtype.kind not in "iuf" or not len(values):
+    if dtype.kind not in "iu" or not len(values):
         return
+    if values.dtype.kind not in "iufO":
+        return
+    if values.dtype.kind == "O":
+        # Exact integers (e.g. arbitrary-precision sums) as Python objects
+        if not all(isinstance(v, (int, np.integer)) for v in values):
+            return
+        vmin = min(values)
+        vmax = max(values)
+    else:
+        vmin, vmax = values.min(), values.max()
     info = np.iinfo(dtype)
-    vmin, vmax = values.min(), values.max()
     if vmin < info.min or vmax > info.max:
-        raise ValueError(
+        wider = {"int64": "uint64"}.get(dtype.name, "int64")
+        if dtype.name == "uint64":
+            hint = "No wider integer storage type is available."
+        else:
+            hint = (
+                f"Retry storing the column as {wider}, e.g. with "
+                f"dtypes={{'{col}': '{wider}'}} in Python or "
+                f"--field {col}:dtype={wider} on the command line."
+            )
+        raise IntegerOverflowError(
             f"Values in pixel column '{col}' range from {vmin} to {vmax}, which "
-            f"doesn't fit in the column's data type ({dtype}). Retry storing the "
-            f"column as int64, e.g. with dtypes={{'{col}': 'int64'}} in Python "
-            f"or --field {col}:dtype=int64 on the command line."
+            f"doesn't fit in the column's data type ({dtype}). {hint}"
         )
 
 
@@ -354,6 +377,24 @@ def write_indexes(
     )
 
 
+def _storable_int(value: Any) -> Any:
+    """
+    Make an exact integer storable as an HDF5 attribute.
+
+    Integers that fit in int64 or uint64 are stored as such. Bigger (or
+    more negative) integers are stored as decimal strings, which
+    :func:`cooler.api.info` parses back to exact Python ints.
+    """
+    if not isinstance(value, (int, np.integer)) or isinstance(value, bool):
+        return value
+    value = int(value)
+    if np.iinfo(np.int64).min <= value <= np.iinfo(np.int64).max:
+        return np.int64(value)
+    if 0 <= value <= np.iinfo(np.uint64).max:
+        return np.uint64(value)
+    return str(value)
+
+
 def write_info(grp: h5py.Group, info: dict, scool: bool = False) -> None:
     """
     Write the file description and metadata attributes.
@@ -388,6 +429,9 @@ def write_info(grp: h5py.Group, info: dict, scool: bool = False) -> None:
         info["format"] = MAGIC
         info["format-version"] = __format_version__
     info["format-url"] = URL
+    for key in ("sum", "nnz"):
+        if key in info:
+            info[key] = _storable_int(info[key])
     grp.attrs.update(info)
 
 
@@ -621,6 +665,10 @@ class _CoolerWriter:
         bins may omit source bins, whole chromosomes, or be empty. The output
         cooler's ``bin-layout`` attribute is set to ``"sparse"``. An ordinary
         bin table must still tile the chromosomes.
+    unbounded_pixels : bool, optional
+        Don't cap the pixel table at the number of matrix elements. Used for
+        temporary tables whose records still await aggregation and can
+        outnumber the triangle. The final cooler keeps the usual bound.
 
     """
 
@@ -645,6 +693,7 @@ class _CoolerWriter:
         binsize: int | None = None,
         chromsizes: pd.Series | dict | None = None,
         sparse: bool = False,
+        unbounded_pixels: bool = False,
     ):
         file_path, group_path = parse_cooler_uri(cool_uri)
         self.file_path = op.realpath(file_path)
@@ -713,7 +762,11 @@ class _CoolerWriter:
                 )
             else:
                 self._link_tables(f, grp, link_tables_from)
-            if symmetric_upper:
+            if unbounded_pixels:
+                # Temporary pixel tables (e.g. sort runs that still hold
+                # unaggregated duplicates) can outnumber the matrix triangle
+                max_size = None
+            elif symmetric_upper:
                 max_size = self.n_bins * (self.n_bins - 1) // 2 + self.n_bins
             else:
                 max_size = self.n_bins * self.n_bins
@@ -823,6 +876,11 @@ class _CoolerWriter:
         chunk = self._validate(chunk)
         for col in self.columns:
             _check_fits_dtype(col, chunk[col], self.dtypes[col])
+            if chunk[col].dtype.kind == "O":
+                # Exact integers held as Python objects: they were just
+                # checked to fit, so the cast is lossless (HDF5 can't store
+                # object arrays directly)
+                chunk[col] = np.asarray(chunk[col], dtype=self.dtypes[col])
 
         with self._open() as f:
             grp = f[self._tmp_path]["pixels"]
@@ -832,7 +890,8 @@ class _CoolerWriter:
                 dset[self.nnz : self.nnz + n] = chunk[col]
         self.nnz += n
         if "count" in chunk:
-            self.sum += chunk["count"].sum()
+            # Exact for integers of any magnitude; never wraps
+            self.sum += exact_column_sum(chunk["count"])
 
     def finish(self) -> None:
         """Write the indexes and metadata, and move the cooler into place."""
@@ -1085,6 +1144,7 @@ class _UnorderedCoolerWriter:
             dtypes=self.run_dtypes,
             mode="a",
             ensure_sorted=True,
+            unbounded_pixels=True,
             **self.run_kwargs,
         ) as w:
             w.write(chunk)
@@ -1095,11 +1155,13 @@ class _UnorderedCoolerWriter:
         from .._reduce import CoolerMerger
         from ..api import Cooler
 
+        value_cols = [c for c in self.run_columns if c not in ("bin1_id", "bin2_id")]
         return CoolerMerger(
             [Cooler(uri) for uri in uris],
             self.mergebuf,
-            columns=[c for c in self.run_columns if c not in ("bin1_id", "bin2_id")],
+            columns=value_cols,
             agg=self.merge_agg,
+            dtypes={c: self.run_dtypes[c] for c in value_cols},
         )
 
     def _finish_chunk(self, chunk: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
@@ -1115,39 +1177,53 @@ class _UnorderedCoolerWriter:
                 )
         return chunk
 
+    def _merge_pass(self, runs: list[str]) -> list[str]:
+        """Merge groups of runs into fewer intermediate runs (one pass)."""
+        n = len(runs)
+        if self.mergebuf < 2:
+            raise ValueError(
+                f"Cannot merge {n} runs with mergebuf={self.mergebuf}: the "
+                "buffer must hold at least one pixel per run. Increase mergebuf."
+            )
+        # Merge in passes: groups of ~sqrt(n) runs, keeping both the group
+        # size and the number of groups within max_merge where possible. A
+        # group never exceeds mergebuf, so the merge buffer stays bounded.
+        group_size = max(
+            int(np.ceil(np.sqrt(n))),
+            int(np.ceil(n / self.max_merge)) if self.max_merge > 0 else 2,
+        )
+        caps = [self.mergebuf] + ([self.max_merge] if self.max_merge > 0 else [])
+        group_size = max(2, min([group_size, *caps]))
+        tf2 = self._new_temp_file()
+        merged_runs = []
+        for lo in range(0, n, group_size):
+            hi = min(lo + group_size, n)
+            uri = f"{tf2.name}::{lo}-{hi}"
+            logger.info(f"Merging chunks {lo}-{hi}: {uri}")
+            with _CoolerWriter(
+                uri,
+                self.bins,
+                columns=self.run_columns,
+                dtypes=self.run_dtypes,
+                mode="a",
+                **self.run_kwargs,
+            ) as w:
+                for chunk in self._merged(runs[lo:hi]):
+                    w.write(chunk)
+            merged_runs.append(uri)
+        return merged_runs
+
     def finish(self) -> None:
         """Merge the runs and write the output cooler."""
         if self._done:
             return
         try:
             runs = self._runs
-            if len(runs) > self.max_merge > 0:
-                # Merge in two passes: groups of ~sqrt(n) runs, keeping both
-                # the group size and the number of groups within max_merge
-                # where possible.
-                n = len(runs)
-                group_size = max(
-                    int(np.ceil(np.sqrt(n))), int(np.ceil(n / self.max_merge))
-                )
-                group_size = max(2, min(group_size, self.max_merge))
-                tf2 = self._new_temp_file()
-                merged_runs = []
-                for lo in range(0, n, group_size):
-                    hi = min(lo + group_size, n)
-                    uri = f"{tf2.name}::{lo}-{hi}"
-                    logger.info(f"Merging chunks {lo}-{hi}: {uri}")
-                    with _CoolerWriter(
-                        uri,
-                        self.bins,
-                        columns=self.run_columns,
-                        dtypes=self.run_dtypes,
-                        mode="a",
-                        **self.run_kwargs,
-                    ) as w:
-                        for chunk in self._merged(runs[lo:hi]):
-                            w.write(chunk)
-                    merged_runs.append(uri)
-                runs = merged_runs
+            while len(runs) > 1 and (
+                (self.max_merge > 0 and len(runs) > self.max_merge)
+                or len(runs) > self.mergebuf
+            ):
+                runs = self._merge_pass(runs)
 
             logger.info(f"Merging into {self.cool_uri}")
             with _CoolerWriter(

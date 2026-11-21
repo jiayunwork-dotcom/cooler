@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os.path as op
-import warnings
 from bisect import bisect_right
 from collections import defaultdict
 from collections.abc import Iterator
@@ -19,7 +18,8 @@ from ._typing import MapFunctor
 from ._version import __format_version_mcool__
 from .api import Cooler
 from .create import ContactBinner, create
-from .create._writer import _COMBINE_AGGS, _value_aggs
+from .create._ingest import exact_column_sum, groupby_agg_exact
+from .create._writer import _COMBINE_AGGS, _check_fits_dtype, _value_aggs
 from .parallel import _ProcessPool, get_lock
 from .util import GenomeSegmentation, parse_cooler_uri
 
@@ -29,9 +29,6 @@ __all__ = ["coarsen_cooler", "merge_coolers", "zoomify_cooler"]
 logger = get_logger("cooler.reduce")
 
 HIGLASS_TILE_DIM = 256
-
-# The most bin1_offset entries a merge reads from all its inputs combined
-_MERGE_INDEX_SAMPLES = 2**24
 
 
 def merge_breakpoints(
@@ -48,6 +45,11 @@ def merge_breakpoints(
 
     However, the ``bufsize`` condition is not guaranteed (see Notes): check
     ``cum_nrecords``.
+
+    .. note::
+        Kept for backward compatibility. :class:`CoolerMerger` no longer
+        partitions merges along whole bin1 rows: it streams bounded slices of
+        the pixel tables, so the buffer limit always holds.
 
     Parameters
     ----------
@@ -114,9 +116,168 @@ def merge_breakpoints(
 _AGGS = _COMBINE_AGGS
 
 
+def _chrom_catalog(clr: Cooler) -> tuple[list[str], np.ndarray]:
+    """A cooler's ordered chromosome names and lengths, as values."""
+    sizes = clr.chromsizes
+    return [str(x) for x in sizes.index], np.asarray(sizes)
+
+
+def _bin_axis(clr: Cooler) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """A cooler's bin table as value arrays: chrom names, starts, ends."""
+    bins = clr.bins()[["chrom", "start", "end"]][:]
+    chrom = bins["chrom"]
+    if chrom.dtype.kind in "iu":
+        # Raw integer codes (stored without an HDF5 enum): map them back to
+        # names through the chromosome catalog.
+        names = np.asarray(list(clr.chromnames), dtype=object)[chrom.to_numpy()]
+    else:
+        names = chrom.astype(str).to_numpy()
+    return names, bins["start"].to_numpy(), bins["end"].to_numpy()
+
+
+def check_same_axes(coolers: list[Cooler]) -> None:
+    """
+    Verify that all the coolers share the same axis: the chromosome catalog
+    (names in order, and lengths, including chromosomes that have no bins)
+    and every row of the bin table. Integer storage width is ignored: the
+    same coordinates stored as int32 or int64 compare equal.
+    """
+    ref = coolers[0]
+    ref_names, ref_lengths = _chrom_catalog(ref)
+    ref_bins = _bin_axis(ref)
+    for clr in coolers[1:]:
+        names, lengths = _chrom_catalog(clr)
+        if names != ref_names:
+            raise ValueError(
+                "Coolers must have the same chromosomes in the same order: "
+                f"'{clr.filename}' differs from '{ref.filename}'."
+            )
+        if not np.array_equal(lengths, ref_lengths):
+            raise ValueError(
+                "Coolers must have the same chromosome lengths: "
+                f"'{clr.filename}' differs from '{ref.filename}'."
+            )
+        bins = _bin_axis(clr)
+        if len(bins[0]) != len(ref_bins[0]) or not all(
+            np.array_equal(stored, ref) for stored, ref in zip(bins, ref_bins)
+        ):
+            raise ValueError(
+                "Coolers must have the same bin table: "
+                f"'{clr.filename}' differs from '{ref.filename}'."
+            )
+
+
+def _normalize_int(arr: np.ndarray) -> np.ndarray:
+    """
+    Canonicalize an integer array for concatenation: int64 when the values
+    fit, else an object array of exact Python ints. This prevents numpy from
+    silently coercing mixed int64/uint64 data to lossy float64.
+    """
+    arr = np.asarray(arr)
+    kind = arr.dtype.kind
+    if kind == "i":
+        return arr if arr.dtype == np.int64 else arr.astype(np.int64)
+    if kind == "u":
+        if not len(arr) or arr.max() <= np.iinfo(np.int64).max:
+            return arr.astype(np.int64)
+        return arr.astype(object)
+    return arr
+
+
+def _scalar_row(value: Any) -> np.ndarray:
+    """A 1-row array for an aggregated value, kept exact at any magnitude."""
+    if isinstance(value, (int, np.integer)) and not isinstance(value, bool):
+        value = int(value)
+        if np.iinfo(np.int64).min <= value <= np.iinfo(np.int64).max:
+            return np.array([value], dtype=np.int64)
+        return np.array([value], dtype=object)
+    return np.asarray([value])
+
+
+class _PixelStream:
+    """
+    A sequential cursor over one cooler's pixel table.
+
+    Holds at most one loaded slice at a time; ``load`` replaces the buffer,
+    so the number of buffered (loaded but unconsumed) pixels is always
+    known and bounded by the caller.
+    """
+
+    __slots__ = ("buf", "clr", "fields", "i", "nnz", "pos")
+
+    def __init__(self, clr: Cooler, fields: list[str]):
+        self.clr = clr
+        self.fields = fields
+        self.nnz = clr.info["nnz"]
+        self.pos = 0  # next row to load from disk
+        self.buf: dict[str, np.ndarray] | None = None
+        self.i = 0  # next unconsumed row within the buffer
+
+    @property
+    def eof(self) -> bool:
+        return self.pos >= self.nnz
+
+    @property
+    def buffered(self) -> int:
+        return 0 if self.buf is None else len(self.buf["bin1_id"]) - self.i
+
+    def load(self, n: int) -> int:
+        """Load up to ``n`` more rows; returns how many were loaded."""
+        hi = min(self.pos + n, self.nnz)
+        if hi <= self.pos:
+            return 0
+        df = self.clr.pixels()[self.fields][self.pos : hi]
+        self.buf = {k: _normalize_int(v.to_numpy()) for k, v in df.items()}
+        self.i = 0
+        n = hi - self.pos
+        self.pos = hi
+        return n
+
+    @property
+    def last_key(self) -> tuple[int, int]:
+        return (self.buf["bin1_id"][-1], self.buf["bin2_id"][-1])
+
+    def _take(self, n: int) -> dict[str, np.ndarray]:
+        out = {col: values[self.i : self.i + n] for col, values in self.buf.items()}
+        self.i += n
+        return out
+
+    def take_lt(self, boundary: tuple[int, int] | None) -> dict[str, np.ndarray]:
+        """Consume the buffered prefix with keys strictly below ``boundary``."""
+        b1 = self.buf["bin1_id"][self.i :]
+        b2 = self.buf["bin2_id"][self.i :]
+        if boundary is None:
+            n = len(b1)
+        else:
+            # The buffer is sorted, so this mask is a prefix
+            mask = (b1 < boundary[0]) | ((b1 == boundary[0]) & (b2 < boundary[1]))
+            n = int(mask.sum())
+        return self._take(n)
+
+    def take_eq(self, key: tuple[int, int]) -> dict[str, np.ndarray]:
+        """Consume the buffered prefix of records with this exact key."""
+        b1 = self.buf["bin1_id"][self.i :]
+        b2 = self.buf["bin2_id"][self.i :]
+        mask = (b1 == key[0]) & (b2 == key[1])
+        return self._take(int(mask.sum()))
+
+
 class CoolerMerger(ContactBinner):
     """
     Implementation of cooler merging.
+
+    Streams the inputs in a bounded k-way merge: at most ``mergebuf`` source
+    pixels are held in memory at any time, however wide a matrix row is, and
+    output is produced in batches of at most ``mergebuf`` pixels. Integer
+    sums are exact at any magnitude; a total that doesn't fit the output
+    column's dtype raises :class:`IntegerOverflowError` rather than wrapping.
+
+    Attributes
+    ----------
+    read_sizes : list of int
+        Diagnostic: the size of every source slice loaded, in order.
+    max_buffered : int
+        Diagnostic: the peak number of source pixels held at once.
 
     """
 
@@ -126,100 +287,178 @@ class CoolerMerger(ContactBinner):
         mergebuf: int,
         columns: list[str] | None = None,
         agg: dict[str, Any] | None = None,
+        dtypes: dict[str, Any] | None = None,
     ):
         self.coolers = list(coolers)
-        self.mergebuf = mergebuf
-        self.columns = ["count"] if columns is None else columns
+        if not self.coolers:
+            raise ValueError("No coolers to merge.")
+        self.mergebuf = int(mergebuf)
+        if self.mergebuf < 1:
+            raise ValueError(f"mergebuf must be a positive integer, not {mergebuf}.")
+        self.columns = ["count"] if columns is None else list(columns)
         self.agg = _value_aggs(self.columns, agg)
+        if dtypes is None:
+            # Check totals against the common dtype of the inputs
+            dtypes = {}
+            for col in self.columns:
+                dtypes[col] = np.result_type(
+                    *[clr.pixels().dtypes[col] for clr in self.coolers]
+                )
+        self.dtypes = {col: np.dtype(dtypes[col]) for col in self.columns}
 
-        # check compatibility between input coolers
-        binsize = coolers[0].binsize
-        if binsize is not None:
-            if len({c.binsize for c in coolers}) > 1:
-                raise ValueError("Coolers must have the same resolution")
-            chromsizes = coolers[0].chromsizes
-            for i in range(1, len(coolers)):
-                other = coolers[i].chromsizes
-                # Lengths may be stored as int32 or int64
-                if not (
-                    other.index.equals(chromsizes.index)
-                    and np.array_equal(other.to_numpy(), chromsizes.to_numpy())
-                ):
-                    raise ValueError("Coolers must have the same chromosomes")
-        else:
-            bins = coolers[0].bins()[["chrom", "start", "end"]][:]
-            for i in range(1, len(coolers)):
-                bins2 = coolers[i].bins()[["chrom", "start", "end"]][:]
-                if (len(bins2) != len(bins)) or not np.all(bins2 == bins):
-                    raise ValueError("Coolers must have same bin structure")
+        # All inputs must share the same axis
+        check_same_axes(self.coolers)
+
+        # The merge needs one buffer slot per non-empty input
+        n_live = sum(1 for clr in self.coolers if clr.info["nnz"] > 0)
+        if n_live > self.mergebuf:
+            raise ValueError(
+                f"Cannot merge {n_live} non-empty inputs with "
+                f"mergebuf={self.mergebuf}: the buffer must hold at least one "
+                "pixel per input. Increase mergebuf."
+            )
+
+        self._fields = ["bin1_id", "bin2_id", *self.columns]
+        self.read_sizes: list[int] = []
+        self.max_buffered = 0
 
     def __iter__(self) -> Iterator[dict[str, np.ndarray]]:
-        # Load the bin1_offset indexes, without keeping the files open. With
-        # many bins and inputs, whole indexes don't fit in memory, so only
-        # every stride-th entry is read, and epochs start and end on those bins.
-        with self.coolers[0].open("r") as grp:
-            n = len(grp["indexes/bin1_offset"])
-        stride = max(1, -(-n * len(self.coolers) // _MERGE_INDEX_SAMPLES))
-        sampled_bin1_ids = np.arange(0, n, stride)
-        if sampled_bin1_ids[-1] != n - 1:
-            sampled_bin1_ids = np.append(sampled_bin1_ids, n - 1)
-        indexes = []
-        for c in self.coolers:
-            with c.open("r") as grp:
-                dset = grp["indexes/bin1_offset"]
-                index = dset[::stride]
-                if len(index) < len(sampled_bin1_ids):
-                    index = np.append(index, dset[n - 1])
-                indexes.append(index)
+        streams = [
+            _PixelStream(clr, self._fields)
+            for clr in self.coolers
+            if clr.info["nnz"] > 0
+        ]
+        if not streams:
+            return
+        mergebuf = self.mergebuf
+        key_cols = ["bin1_id", "bin2_id"]
+        out_batches: list[dict[str, np.ndarray]] = []
+        out_n = 0
+        pend_key: tuple[int, int] | None = None
+        pend_vals: dict[str, Any] = {}
 
-        # Calculate the common partition of bin1 offsets that define the epochs
-        # of merging data.
-        partition, cum_nrecords = merge_breakpoints(indexes, self.mergebuf)
-        bin1_partition = sampled_bin1_ids[partition]
-        nrecords_per_epoch = np.diff(cum_nrecords)
-        if len(nrecords_per_epoch) and nrecords_per_epoch.max() > self.mergebuf:
-            unit = "a row" if stride == 1 else f"a block of {stride:,} rows"
-            warnings.warn(
-                f"Merging will buffer up to {nrecords_per_epoch.max():,} pixels at "
-                f"once, more than mergebuf={self.mergebuf:,}, because {unit} of "
-                "the matrix can't be split across merge epochs.",
-                stacklevel=2,
-            )
-        nnzs = [len(c.pixels()) for c in self.coolers]
-        logger.info(
-            f"Merging {sum(nnzs):,} pixels from {len(self.coolers)} coolers in "
-            f"{len(nrecords_per_epoch)} epochs"
-        )
-        logger.debug(f"Pixels per cooler: {nnzs}")
-        logger.debug(f"Epoch boundaries (bin1 IDs): {bin1_partition}")
-        logger.debug(f"Pixels per epoch: {nrecords_per_epoch}")
+        def flush():
+            nonlocal out_batches, out_n
+            if not out_n:
+                return
+            chunk = self._finalize(out_batches)
+            out_batches = []
+            out_n = 0
+            n = len(chunk["bin1_id"])
+            for lo in range(0, n, mergebuf):
+                yield {col: values[lo : lo + mergebuf] for col, values in chunk.items()}
 
-        starts = [0] * len(self.coolers)
-        for i in partition[1:]:
-            stops = [index[i] for index in indexes]
+        while True:
+            # Refill empty buffers. Invariant: the number of pixels loaded
+            # but not yet consumed never exceeds mergebuf.
+            empties = [s for s in streams if s.buffered == 0 and not s.eof]
+            if empties:
+                avail = mergebuf - sum(s.buffered for s in streams)
+                # Distribute the available slots as evenly as possible
+                base, extra = divmod(avail, len(empties))
+                for j, s in enumerate(empties):
+                    self.read_sizes.append(s.load(base + (j < extra)))
+                self.max_buffered = max(
+                    self.max_buffered, sum(s.buffered for s in streams)
+                )
 
-            # extract, concat
-            combined = pd.concat(
-                [
-                    c.pixels()[start:stop]
-                    for c, start, stop in zip(self.coolers, starts, stops)
-                    if (stop - start) > 0
-                ],
-                axis=0,
-                ignore_index=True,
-            )
+            active = [s for s in streams if s.buffered > 0]
+            if not active:
+                if pend_key is not None:
+                    out_batches.append(self._pend_chunk(pend_key, pend_vals))
+                    out_n += 1
+                yield from flush()
+                break
 
-            # sort and aggregate
-            df = (
-                combined.groupby(["bin1_id", "bin2_id"], sort=True)
-                .aggregate(self.agg)
-                .reset_index()
-            )
+            # Keys strictly below the boundary are complete in every input:
+            # each non-EOF input's unread records start at its last buffered
+            # key or beyond, and EOF inputs have nothing left on disk.
+            boundary = None
+            for s in active:
+                if s.eof:
+                    continue
+                key = s.last_key
+                if boundary is None or key < boundary:
+                    boundary = key
 
-            yield {k: v.values for k, v in df.items()}
+            if pend_key is not None and (boundary is None or pend_key < boundary):
+                # Every input has moved past the pending key: emit its total
+                out_batches.append(self._pend_chunk(pend_key, pend_vals))
+                out_n += 1
+                pend_key, pend_vals = None, {}
+                if out_n >= mergebuf:
+                    yield from flush()
 
-            logger.debug(f"Pixels merged up to: {stops}")
-            starts = stops
+            # Combine all buffered records below the boundary in one
+            # vectorized, exactly-summed aggregation
+            slices = [s.take_lt(boundary) for s in active]
+            slices = [sl for sl in slices if len(sl["bin1_id"])]
+            if slices:
+                data = {
+                    col: np.concatenate([sl[col] for sl in slices])
+                    for col in [*key_cols, *self.columns]
+                }
+                combined = groupby_agg_exact(pd.DataFrame(data), key_cols, self.agg)
+                out_batches.append(
+                    {col: _normalize_int(combined[col].to_numpy()) for col in data}
+                )
+                out_n += len(combined)
+                if out_n >= mergebuf:
+                    yield from flush()
+
+            if boundary is not None:
+                # The boundary key itself may continue on disk: accumulate it
+                # as the single pending key and free its buffer space
+                if pend_key is None:
+                    pend_vals = {col: None for col in self.columns}
+                for s in active:
+                    sl = s.take_eq(boundary)
+                    if not len(sl["bin1_id"]):
+                        continue
+                    for col, f in self.agg.items():
+                        v = sl[col]
+                        if f == "sum":
+                            v = exact_column_sum(v)
+                        elif f == "min":
+                            v = v.min()
+                        else:
+                            v = v.max()
+                        cur = pend_vals[col]
+                        if cur is None:
+                            pend_vals[col] = v
+                        elif f == "sum":
+                            pend_vals[col] = cur + v
+                        elif f == "min":
+                            pend_vals[col] = min(cur, v)
+                        else:
+                            pend_vals[col] = max(cur, v)
+                pend_key = boundary
+
+    def _pend_chunk(self, key, vals) -> dict[str, np.ndarray]:
+        chunk = {
+            "bin1_id": np.array([key[0]], dtype=np.int64),
+            "bin2_id": np.array([key[1]], dtype=np.int64),
+        }
+        for col in self.columns:
+            chunk[col] = _scalar_row(vals[col])
+        return chunk
+
+    def _finalize(self, batches) -> dict[str, np.ndarray]:
+        """Concatenate queued rows, check integer ranges, cast to dtypes."""
+        out = {}
+        for col in ["bin1_id", "bin2_id", *self.columns]:
+            arr = np.concatenate([b[col] for b in batches])
+            if col in ("bin1_id", "bin2_id"):
+                out[col] = arr.astype(np.int64, copy=False)
+                continue
+            dtype = self.dtypes[col]
+            if arr.dtype.kind == "O" and not len(arr):
+                arr = np.empty(0, dtype=dtype)
+            else:
+                _check_fits_dtype(col, arr, dtype)
+                arr = np.asarray(arr, dtype=dtype)
+            out[col] = arr
+        return out
 
 
 def merge_coolers(
@@ -245,7 +484,10 @@ def merge_coolers(
     input_uris : list of str
         List of input file path or URIs of coolers to combine.
     mergebuf : int
-        Maximum number of pixels processed at a time.
+        Maximum number of source pixels held in memory at a time. This is a
+        hard bound: wide matrix rows are split across read batches, and the
+        output is produced in batches of at most this size. It must be at
+        least the number of non-empty inputs.
     columns : list of str, optional
         Specify which pixel value columns to include in the aggregation.
         Default is to use all available value columns.
@@ -264,6 +506,21 @@ def merge_coolers(
     The default output file mode is 'w'. If appending output to an existing
     file, pass `mode='a'`.
 
+    All inputs must share the same axis: the same chromosomes in the same
+    order with the same lengths (including chromosomes without bins), and
+    the same bin table. This is checked before the output is created; the
+    integer width the axis is stored with doesn't matter. Inputs with a
+    sparse bin layout (``bin-layout: sparse``) merge into a sparse output
+    that keeps the full chromosome catalog and the gaps.
+
+    Integer sums are exact at any magnitude. A total that doesn't fit the
+    output column's dtype raises ``IntegerOverflowError`` (an
+    ``OverflowError``) instead of wrapping; request a wider dtype, e.g.
+    ``dtypes={"count": "uint64"}``, for large counts. The ``sum`` metadata
+    of the output is always exact, even when it exceeds 64 bits. A failure
+    never leaves a partial cooler behind: an existing group at the
+    destination and any sibling groups are preserved.
+
     See also
     --------
     cooler.coarsen_cooler
@@ -276,6 +533,8 @@ def merge_coolers(
         logger.debug(f"Input: {uri}")
 
     clrs = [Cooler(path) for path in input_uris]
+    if not clrs:
+        raise ValueError("No input coolers were given.")
 
     is_symm = [clr.storage_mode == "symmetric-upper" for clr in clrs]
     if all(is_symm):
@@ -305,9 +564,27 @@ def merge_coolers(
             # Find a common dtype to accomodate all the inputs being merged.
             dtypes[col] = np.result_type(*dtype_map[col])
 
+    # A sparse bin layout (an extension with gaps in the bin table) is kept
+    # sparse; ordinary tiling layouts are delivered as ordinary layouts.
+    sparse = any(clr.info.get("bin-layout") == "sparse" for clr in clrs)
+
     bins = clrs[0].bins()[["chrom", "start", "end"]][:]
     assembly = clrs[0].info.get("genome-assembly", None)
-    iterator = CoolerMerger(clrs, mergebuf=mergebuf, columns=columns, agg=agg)
+    # Validates the axes before the output is created
+    iterator = CoolerMerger(
+        clrs,
+        mergebuf=mergebuf,
+        columns=columns,
+        agg=agg,
+        dtypes={col: dtypes[col] for col in columns},
+    )
+
+    if sparse:
+        kwargs.setdefault("sparse", True)
+        kwargs.setdefault("chromsizes", clrs[0].chromsizes)
+        binsize = None
+    else:
+        binsize = clrs[0].binsize
 
     create(
         output_uri,
@@ -317,7 +594,7 @@ def merge_coolers(
         dtypes=dtypes,
         assembly=assembly,
         symmetric_upper=symmetric_upper,
-        binsize=clrs[0].binsize,
+        binsize=binsize,
         **kwargs,
     )
 
@@ -744,8 +1021,7 @@ def coarsen_cooler(
     # bin1_id, bin2_id dtypes = dict(clr.pixels().dtypes.drop(['bin1_id', 'bin2_id']))
     if target_bins is not None and factor is not None:
         raise ValueError(
-            "Pass either an integer factor or an explicit target_bins table, "
-            "not both."
+            "Pass either an integer factor or an explicit target_bins table, not both."
         )
     if target_bins is None and factor is None:
         raise ValueError("Either factor or target_bins must be given.")
@@ -755,9 +1031,7 @@ def coarsen_cooler(
     if factor is not None:
         factor = int(factor)
         if factor < 2:
-            raise ValueError(
-                f"The coarsening factor must be at least 2, not {factor}."
-            )
+            raise ValueError(f"The coarsening factor must be at least 2, not {factor}.")
 
     if columns is None:
         columns = ["count"]
@@ -1065,8 +1339,7 @@ def _zoomify_bin_levels(
         )
     if not isinstance(bin_levels, dict):
         raise ValueError(  # noqa: TRY004
-            "bin_levels must be a dict mapping level names to target bin "
-            "DataFrames."
+            "bin_levels must be a dict mapping level names to target bin DataFrames."
         )
     names = []
     for name in bin_levels:
@@ -1088,8 +1361,7 @@ def _zoomify_bin_levels(
     for col in columns:
         if col not in input_dtypes:
             raise ValueError(
-                f"Pixel value column '{col}' not found in input "
-                f"'{base.filename}'."
+                f"Pixel value column '{col}' not found in input '{base.filename}'."
             )
     dtypes = {} if dtypes is None else dict(dtypes)
     # Only the caller's explicit dtypes are forwarded; otherwise each level

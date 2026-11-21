@@ -20,7 +20,7 @@ from . import (
     CHROMID_DTYPE,
     PIXEL_FIELDS,
 )
-from ._ingest import BadInputError
+from ._ingest import BadInputError, groupby_agg_exact
 from ._writer import (
     _CoolerWriter,
     _pixel_schema,
@@ -297,8 +297,10 @@ _DOC_OTHER_PARAMS = """
     Other parameters
     ----------------
     mergebuf : int, optional
-        Maximum number of records to buffer in memory at any give time during
-        the merge step.
+        Maximum number of source records held in memory at any given time
+        during the merge step. This is a hard bound: wide matrix rows are
+        split across read batches, and runs are merged in additional
+        temporary rounds when there are more runs than the buffer holds.
     delete_temp : bool, optional
         Whether to delete temporary files when finished.
         Useful for debugging. Default is True.
@@ -510,7 +512,9 @@ def _combine_duplicates(
         i = int(np.argmax(repeated.to_numpy()))
         pixel = tuple(int(x) for x in pixels[keys].iloc[i])
         raise BadInputError(f"Found a duplicate pixel {pixel} in the input.")
-    return pixels.groupby(keys, sort=False).agg(aggs).reset_index()
+    # Integer sums stay exact at any magnitude; the writer's range check
+    # decides whether they fit the output dtype
+    return groupby_agg_exact(pixels, keys, aggs)
 
 
 @_format_docstring(other_parameters=_DOC_OTHER_PARAMS, notes=_DOC_NOTES)
