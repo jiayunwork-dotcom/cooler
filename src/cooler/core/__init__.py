@@ -1,4 +1,5 @@
 from ._rangequery import (
+    VIRTUAL_FIELDS,
     CSRReader,
     DirectRangeQuery2D,
     FillLowerRangeQuery2D,
@@ -9,6 +10,7 @@ from ._selectors import RangeSelector1D, RangeSelector2D, _IndexingMixin  # noqa
 from ._tableops import delete, get, put
 
 __all__ = [
+    "VIRTUAL_FIELDS",
     "CSRReader",
     "DirectRangeQuery2D",
     "FillLowerRangeQuery2D",

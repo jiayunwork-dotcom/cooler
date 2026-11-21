@@ -12,6 +12,7 @@ from ..core import (
     FillLowerRangeQuery2D,
     region_to_extent,
 )
+from ..expected import load_expected
 from ..util import parse_region
 from . import cli
 from ._util import DelimitedTuple
@@ -124,6 +125,15 @@ def make_annotator(bins, balanced, join, annotate, one_based_ids, one_based_star
     show_default=True,
 )
 @click.option(
+    "--expected",
+    "expected_layer",
+    default=None,
+    help="Name of a stored distance-background layer (see "
+    "`cooler.estimate_expected`). Adds `expected` and `oe` (observed over "
+    "expected) columns using the layer's bound weights and selection. "
+    "Incompatible with --balanced/--weight-name and with non-count columns.",
+)
+@click.option(
     "--weight-name",
     help="Name of the bin table column containing the balancing weights. "
     "Implies --balanced. [default: weight]",
@@ -183,6 +193,7 @@ def dump(
     range2,
     fill_lower,
     balanced,
+    expected_layer,
     weight_name,
     join,
     annotate,
@@ -242,6 +253,7 @@ def dump(
                 range2,
                 fill_lower,
                 balanced,
+                expected_layer,
                 weight_name,
                 join,
                 annotate,
@@ -289,6 +301,7 @@ def _pixel_chunks(
     range2,
     fill_lower,
     balanced,
+    expected_layer,
     weight_name,
     join,
     annotate,
@@ -310,6 +323,20 @@ def _pixel_chunks(
                 param_hint="'--annotate'",
             )
 
+    background = None
+    if expected_layer is not None:
+        if balanced or weight_name is not None:
+            raise click.BadParameter(
+                "--expected uses the balancing weights bound to the layer and "
+                "cannot be combined with --balanced/--weight-name",
+                param_hint="'--expected'",
+            )
+        try:
+            result = load_expected(clr, expected_layer)
+        except (KeyError, ValueError) as exc:
+            raise click.ClickException(str(exc)) from None
+        background = result.as_background()
+
     if weight_name is not None or balanced:
         balanced = weight_name or "weight"
         if balanced not in bins.columns:
@@ -317,24 +344,59 @@ def _pixel_chunks(
 
     # Value columns to write: every one by default, or those requested
     pixel_columns = list(clr.pixels().columns)
+    explicit_columns = columns is not None
     if columns is None:
         columns = pixel_columns
-    unknown = [col for col in columns if col not in pixel_columns]
+    allowed = set(pixel_columns)
+    if background is not None:
+        allowed.update(("expected", "oe"))
+    unknown = [col for col in columns if col not in allowed]
     if unknown:
         raise click.BadParameter(
             f"Not in the pixel table: {', '.join(unknown)}",
             param_hint="'--columns'",
         )
     fields = [col for col in columns if col not in ("bin1_id", "bin2_id")]
-    # Balancing needs the counts, even if they aren't written
-    read_fields = list(fields)
-    if balanced and "count" not in read_fields:
-        if "count" not in pixel_columns:
-            raise click.ClickException("Balancing needs a 'count' column")
-        read_fields.append("count")
-    if not read_fields:
-        read_fields = ["count"] if "count" in pixel_columns else pixel_columns[2:3]
-    drop = [col for col in read_fields if col not in fields]
+    if background is not None:
+        virtual_requested = [f for f in ("expected", "oe") if f in fields]
+        if not virtual_requested:
+            if explicit_columns:
+                # The caller asked for stored columns only (e.g. just count);
+                # do not add virtual columns they did not request.
+                virtual_requested = []
+            else:
+                # Default output: emit both virtual columns.
+                virtual_requested = ["expected", "oe"]
+        stored_requested = [f for f in fields if f not in ("expected", "oe")]
+        bad = [f for f in stored_requested if f != "count"]
+        if bad:
+            raise click.BadParameter(
+                "--expected can only be combined with the 'count' field; "
+                f"got {', '.join(bad)}",
+                param_hint="'--columns'",
+            )
+        # The transform always needs count; virtual columns are annotated by
+        # the engine and unrequested ones are dropped before writing.
+        engine_fields = ["count", *virtual_requested]
+        output_value_fields = [
+            *(["count"] if "count" in fields else []),
+            *virtual_requested,
+        ]
+        if not explicit_columns:
+            output_value_fields = ["count", *virtual_requested]
+        drop = [f for f in ("count", "expected", "oe") if f not in output_value_fields]
+    else:
+        engine_fields = list(fields)
+        if not engine_fields:
+            engine_fields = (
+                ["count"] if "count" in pixel_columns else pixel_columns[2:3]
+            )
+        if balanced and "count" not in engine_fields:
+            if "count" not in pixel_columns:
+                raise click.ClickException("Balancing needs a 'count' column")
+            engine_fields.append("count")
+        output_value_fields = fields
+        drop = [col for col in engine_fields if col not in fields]
     drop += [col for col in ("bin1_id", "bin2_id") if col not in columns]
 
     h5 = stack.enter_context(clr.open("r"))
@@ -363,14 +425,16 @@ def _pixel_chunks(
         bbox = (0, n_bins, 0, n_bins)
 
     if fill_lower and clr.storage_mode == "symmetric-upper":
-        engine = FillLowerRangeQuery2D(reader, read_fields, bbox, chunksize)
+        engine = FillLowerRangeQuery2D(
+            reader, engine_fields, bbox, chunksize, background=background
+        )
     else:
-        engine = DirectRangeQuery2D(reader, read_fields, bbox, chunksize)
+        engine = DirectRangeQuery2D(
+            reader, engine_fields, bbox, chunksize, background=background
+        )
 
-    chunks = (
-        pd.DataFrame(dct, columns=["bin1_id", "bin2_id", *read_fields])
-        for dct in engine
-    )
+    output_columns = ["bin1_id", "bin2_id", *engine_fields]
+    chunks = (pd.DataFrame(dct, columns=output_columns) for dct in engine)
 
     if balanced or join or annotate or one_based_ids:
         annotator = make_annotator(

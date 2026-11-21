@@ -956,6 +956,10 @@ COOL_PATH : Path to COOL file or cooler URI.
 
     Apply balancing weights to data. This will print an extra column called `balanced`  [default: False]
 
+.. option:: --expected <expected_layer>
+
+    Name of a stored distance-background layer (see `cooler.estimate_expected`). Adds `expected` and `oe` (observed over expected) columns using the layer's bound weights and selection. Incompatible with --balanced/--weight-name and with non-count columns.
+
 .. option:: --weight-name <weight_name>
 
     Name of the bin table column containing the balancing weights. Implies --balanced. [default: weight]

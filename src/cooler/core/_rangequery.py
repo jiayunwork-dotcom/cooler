@@ -68,9 +68,7 @@ def _is_sparse_layout(h5: h5py.Group) -> bool:
     return value == "sparse"
 
 
-def _uses_offsets(
-    h5: h5py.Group, cid: int, c_lo: int, c_hi: int, binsize: int
-) -> bool:
+def _uses_offsets(h5: h5py.Group, cid: int, c_lo: int, c_hi: int, binsize: int) -> bool:
     """
     Whether fixed-size offset arithmetic selects the right bins.
 
@@ -132,6 +130,28 @@ def transpose(dct: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
 
 def _as_fields(field: str | list[str]) -> list[str]:
     return [field] if isinstance(field, str) else list(field)
+
+
+# Virtual columns materialized by a background model rather than read from
+# the pixel table.
+VIRTUAL_FIELDS = ("expected", "oe")
+
+
+def _split_fields(
+    field: str | list[str], background: Any | None
+) -> tuple[list[str], list[str]]:
+    """Partition requested fields into stored columns and virtual columns."""
+    fields = _as_fields(field)
+    if background is None:
+        return fields, []
+    virtual = [f for f in fields if f in VIRTUAL_FIELDS]
+    real = [f for f in fields if f not in VIRTUAL_FIELDS]
+    unknown = [
+        f for f in fields if f in VIRTUAL_FIELDS and f not in background.virtual_fields
+    ]
+    if unknown:  # pragma: no cover - defensive
+        raise ValueError(f"Unsupported virtual fields: {unknown}")
+    return real, virtual
 
 
 def _single_field(field: str | list[str]) -> str:
@@ -246,13 +266,20 @@ class CSRReader:
             edges = i0 + arg_prune_partition(self.bin1_offsets[i0 : i1 + 1], chunksize)
         return list(zip(edges[:-1], edges[1:]))
 
-    def get_dict_meta(self, field: str | list[str], return_index: bool = False) -> dict:
+    def get_dict_meta(
+        self,
+        field: str | list[str],
+        return_index: bool = False,
+        virtual: list[str] | None = None,
+    ) -> dict:
         dct = {
             "bin1_id": np.empty((0,), dtype=self.dtypes["bin1_id"]),
             "bin2_id": np.empty((0,), dtype=self.dtypes["bin2_id"]),
         }
         for name in _as_fields(field):
             dct[name] = np.empty((0,), dtype=self.dtypes[name])
+        for name in virtual or ():
+            dct[name] = np.empty((0,), dtype=np.float64)
         if return_index:
             dct["__index"] = np.empty((0,), dtype=np.int64)
         return dct
@@ -364,6 +391,11 @@ class BaseRangeQuery2D:
     Mixin class for materializing 2D range queries from a sequence of
     pre-assembled tasks.
 
+    A ``background`` model (see :class:`cooler.expected.BackgroundModel`)
+    enables the virtual numeric fields ``expected`` and ``oe``, which are
+    annotated onto every stored or reflected pixel record rather than read
+    from the pixel table.
+
     """
 
     reader: CSRReader
@@ -372,9 +404,36 @@ class BaseRangeQuery2D:
     return_index: bool
     tasks: list[tuple[Callable, ...]]
 
+    def __init__(self, background: Any | None = None):
+        self.background = background
+        if background is None:
+            self.real_fields, self.virtual_fields = _as_fields(self.field), []
+        else:
+            self.real_fields, self.virtual_fields = _split_fields(
+                self.field, background
+            )
+        # oe is derived from count; keep count out of the output columns but
+        # ensure it is read from storage whenever oe is requested.
+        self._aux_fields = []
+        if "oe" in self.virtual_fields and "count" not in self.real_fields:
+            self._aux_fields.append("count")
+        self.read_fields = [*self.real_fields, *self._aux_fields]
+
+    @property
+    def _all_output_fields(self) -> list[str]:
+        return [*self.real_fields, *self.virtual_fields]
+
+    def _annotate(self, dct: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        if self.background is not None and self.virtual_fields:
+            self.background.annotate(dct, self.virtual_fields)
+        for aux in self._aux_fields:
+            if aux not in self.real_fields and aux in dct:
+                del dct[aux]
+        return dct
+
     def __iter__(self) -> Iterator[dict[str, np.ndarray]]:
         for task in self.tasks:
-            yield task[0](*task[1:])
+            yield self._annotate(task[0](*task[1:]))
 
     @property
     def n_chunks(self) -> int:
@@ -383,14 +442,17 @@ class BaseRangeQuery2D:
     def get(self) -> dict[str, np.ndarray]:
         dct = concat(*self.__iter__())
         if not dct:
-            return self.reader.get_dict_meta(self.field, self.return_index)
+            meta = self.reader.get_dict_meta(
+                self.real_fields, self.return_index, self.virtual_fields
+            )
+            return meta
         return dct
 
     def get_chunk(self, i) -> dict[str, np.ndarray]:
         if not (0 <= i < len(self.tasks)):
             raise IndexError
         task = self.tasks[i]
-        return task[0](*task[1:])
+        return self._annotate(task[0](*task[1:]))
 
     def to_delayed(self) -> list:
         try:
@@ -404,19 +466,33 @@ class BaseRangeQuery2D:
         for task in self.tasks:
             fetcher_delayed = delayed(task[0])
             out.append(fetcher_delayed(*task[1:]))
+        if self.background is not None and self.virtual_fields:
+            out = [delayed(self._annotate)(part) for part in out]
         return out
 
     def to_sparse_matrix(self) -> Any:
-        return spmatrix_slice_from_dict(self.get(), *self.bbox, self.field)
+        return spmatrix_slice_from_dict(self.get(), *self.bbox, self._matrix_field())
 
     def to_sparse_array(self) -> Any:
-        return sparray_slice_from_dict(self.get(), *self.bbox, self.field)
+        return sparray_slice_from_dict(self.get(), *self.bbox, self._matrix_field())
 
     def to_array(self) -> np.ndarray:
-        return array_slice_from_dict(self.get(), *self.bbox, self.field)
+        return array_slice_from_dict(self.get(), *self.bbox, self._matrix_field())
+
+    def _matrix_field(self) -> str:
+        # Matrix outputs need a single value column. Virtual columns live in
+        # the annotated dict alongside stored columns, so they work the same
+        # way: values appear at stored/reflected pixel positions and implicit
+        # zeros stay implicit.
+        fields = self._all_output_fields
+        if len(fields) != 1:
+            raise ValueError(
+                f"Matrix output needs a single value column, but got {fields}."
+            )
+        return fields[0]
 
     def to_frame(self) -> pd.DataFrame:
-        return frame_slice_from_dict(self.get(), self.field)
+        return frame_slice_from_dict(self.get(), self._all_output_fields)
 
     def to_dask_frame(self) -> Any:
         try:
@@ -428,14 +504,20 @@ class BaseRangeQuery2D:
                 "Install dask[dataframe] or dask[complete] with pip."
             ) from None
 
-        meta = self.reader.get_frame_meta(self.field)
+        all_fields = self._all_output_fields
+        meta = self.reader.get_frame_meta(self.real_fields)
+        for name in self.virtual_fields:
+            meta[name] = pd.Series(dtype=np.float64, name=name)
+        meta = meta[["bin1_id", "bin2_id", *all_fields]]
         if not self.tasks:
             return dd.from_pandas(meta, npartitions=1)
 
-        parts = [
-            delayed(frame_slice_from_dict)(delayed(task[0])(*task[1:]), self.field)
-            for task in self.tasks
-        ]
+        parts = []
+        for task in self.tasks:
+            part = delayed(task[0])(*task[1:])
+            if self.background is not None and self.virtual_fields:
+                part = delayed(self._annotate)(part)
+            parts.append(delayed(frame_slice_from_dict)(part, all_fields))
         return dd.from_delayed(parts, meta=meta)
 
 
@@ -483,14 +565,18 @@ class DirectRangeQuery2D(BaseRangeQuery2D):
         bbox: tuple[int, int, int, int],
         chunksize: int,
         return_index: bool = False,
+        background: Any | None = None,
     ):
         self.reader = reader
         self.field = field
         self.bbox = bbox
         self.chunksize = chunksize
         self.return_index = return_index
+        super().__init__(background)
+        # Only stored columns are read from disk; virtual columns are added
+        # from the background model after each chunk is fetched.
         self.tasks = [
-            (reader, field, bbox, span, False, return_index)
+            (reader, self.read_fields, bbox, span, False, return_index)
             for span in reader.get_spans(bbox, chunksize)
         ]
 
@@ -547,12 +633,14 @@ class FillLowerRangeQuery2D(BaseRangeQuery2D):
         bbox: tuple[int, int, int, int],
         chunksize: int,
         return_index: bool = False,
+        background: Any | None = None,
     ):
         self.reader = reader
         self.field = field
         self.bbox = bbox
         self.chunksize = chunksize
         self.return_index = return_index
+        super().__init__(background)
 
         _fetch = self.reader
         _fetch_then_transpose = compose(transpose, self.reader)
@@ -598,5 +686,6 @@ class FillLowerRangeQuery2D(BaseRangeQuery2D):
         for fetcher, box in zip(fetchers, self._bboxes):
             spans = self.reader.get_spans(box, chunksize)
             self.tasks += [
-                (fetcher, field, box, span, True, return_index) for span in spans
+                (fetcher, self.read_fields, box, span, True, return_index)
+                for span in spans
             ]

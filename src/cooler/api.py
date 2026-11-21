@@ -19,11 +19,15 @@ from .core import (
     region_to_extent,
     region_to_offset,
 )
+from .expected import BackgroundModel, ExpectedResult, load_expected
 from .fileops import TEXT_ATTRS, list_coolers
 from .util import closing_hdf5, open_hdf5, parse_cooler_uri, parse_region
 
 __all__ = ["Cooler", "annotate"]
 
+
+# Sentinel telling matrix() that ``balance`` was not passed explicitly.
+_UNSET = object()
 
 # The 4DN data portal and hic2cool store these weight vectors in divisive form
 _4DN_DIVISIVE_WEIGHTS = {"KR", "VC", "VC_SQRT"}
@@ -335,13 +339,14 @@ class Cooler:
     def matrix(
         self,
         field: str | None = None,
-        balance: bool | str = True,
+        balance: bool | str | object = _UNSET,
         sparse: bool = False,
         as_pixels: bool = False,
         join: bool = False,
         ignore_index: bool = True,
         divisive_weights: bool | None = None,
         chunksize: int = 10000000,
+        expected: ExpectedResult | str | None = None,
     ) -> RangeSelector2D:
         """Contact matrix selector
 
@@ -373,6 +378,14 @@ class Cooler:
             multiplicative (False). Weights are always assumed to be
             multiplicative by default unless named KR, VC or VC_SQRT, in which
             case they are assumed to be divisive by default.
+        expected : ExpectedResult or str, optional
+            A distance-background estimate from
+            :func:`cooler.estimate_expected` (in-memory result or the name of
+            a stored layer). When given, reads return observed/expected
+            ratios, with virtual ``expected`` and ``oe`` columns in pixel
+            output. The balance and weight interpretation bound to the
+            estimate are used; explicitly requesting incompatible settings
+            raises. See the module docs of :mod:`cooler.expected`.
 
         Returns
         -------
@@ -393,9 +406,70 @@ class Cooler:
         at the stored pixels of those bins, and the rest of their rows and
         columns are implicit zeros rather than NaN.
 
+        With ``expected``, same-chromosome cells with a finite positive
+        expected value give observed/expected ratios; inter-chromosomal,
+        out-of-range, unsupported and excluded cells are NaN (dense) or
+        implicit zeros (sparse). Valid implicit-zero cells give a ratio of 0.
+
         """
-        if balance in _4DN_DIVISIVE_WEIGHTS and divisive_weights is None:
-            divisive_weights = True
+        balance_explicit = balance is not _UNSET
+        if not balance_explicit:
+            # Historical default; with an expected layer, its binding decides.
+            balance = True
+
+        # Resolve the expected result and lock its balance configuration.
+        if expected is not None:
+            if isinstance(expected, str):
+                exp_result = load_expected(self, expected)
+            elif isinstance(expected, ExpectedResult):
+                exp_result = expected
+                # Verify the in-memory result against this archive now.
+                with open_hdf5(self.store, **self.open_kws) as h5:
+                    grp = h5[self.root]
+                    exp_result.check_bins(grp)
+                    if exp_result.balance:
+                        exp_result.check_weights(grp["bins"][exp_result.weight_name][:])
+            else:
+                raise TypeError(
+                    "expected must be an ExpectedResult, a stored layer name, or None"
+                )
+            if field is not None and field != "count":
+                raise ValueError(
+                    f"expected is only defined for the 'count' field; got {field!r}"
+                )
+            field = "count"
+            if balance_explicit:
+                if isinstance(balance, str):
+                    requested_name = balance
+                    requested_on = True
+                else:
+                    requested_on = bool(balance)
+                    requested_name = "weight"
+                if requested_on != exp_result.balance or (
+                    exp_result.balance and requested_name != exp_result.weight_name
+                ):
+                    raise ValueError(
+                        "The requested balance configuration is incompatible "
+                        "with the expected layer, which is bound to "
+                        f"balance={exp_result.balance}, weight="
+                        f"{exp_result.weight_name!r}"
+                    )
+            if divisive_weights is not None and (
+                divisive_weights != exp_result.divisive_weights
+            ):
+                raise ValueError(
+                    "The requested divisive_weights value is incompatible with "
+                    "the expected layer, which is bound to "
+                    f"divisive_weights={exp_result.divisive_weights}"
+                )
+            # The layer's interpretation wins, including alias defaults.
+            balance = exp_result.weight_name if exp_result.balance else False
+            divisive_weights = exp_result.divisive_weights
+            background = exp_result.as_background()
+        else:
+            background = None
+            if balance in _4DN_DIVISIVE_WEIGHTS and divisive_weights is None:
+                divisive_weights = True
 
         def _slice(field, i0, i1, j0, j1):
             with open_hdf5(self.store, **self.open_kws) as h5:
@@ -415,6 +489,7 @@ class Cooler:
                     divisive_weights,
                     chunksize,
                     self._is_symm_upper,
+                    background=background,
                 )
 
         def _fetch(region, region2=None):
@@ -721,6 +796,7 @@ def matrix(
     divisive_weights: bool = False,
     chunksize: int = 10000000,
     fill_lower: bool = True,
+    background: BackgroundModel | None = None,
 ) -> np.ndarray | coo_matrix | pd.DataFrame:
     """
     Two-dimensional range query on the Hi-C contact heatmap.
@@ -784,6 +860,56 @@ def matrix(
         )
 
     reader = CSRReader(h5["pixels"], h5["indexes/bin1_offset"][:])
+    bbox = (i0, i1, j0, j1)
+
+    if background is not None:
+        if field != "count":
+            raise ValueError(
+                "expected backgrounds are only defined for the 'count' field"
+            )
+        if as_pixels:
+            # Only explicitly stored pixels are returned; the virtual
+            # expected/oe columns are annotated onto those rows only.
+            engine = DirectRangeQuery2D(
+                reader,
+                ["count", "expected", "oe"],
+                bbox,
+                chunksize,
+                return_index=not ignore_index,
+                background=background,
+            )
+            df = engine.to_frame()
+            if join:
+                bins = Cooler(h5).bins()[["chrom", "start", "end"]]
+                df = annotate(df, bins, replace=True)
+            return df
+
+        if fill_lower:
+            engine = FillLowerRangeQuery2D(
+                reader, "count", bbox, chunksize, background=background
+            )
+        else:
+            engine = DirectRangeQuery2D(
+                reader, "count", bbox, chunksize, background=background
+            )
+        arr = engine.to_array()
+
+        # Observed side carries the bound balancing factors; dividing by the
+        # dense expected layout turns valid implicit zeros into exact 0s.
+        bias1, bias2 = background.bias_vectors(i0, i1, j0, j1)
+        obs = arr * np.outer(bias1, bias2)
+        exp = background.dense_expected(bbox)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            oe = np.where(np.isfinite(exp) & (exp > 0), obs / exp, np.nan)
+        # Inter-chromosomal and excluded-bin cells are never ratios.
+        validity = background.dense_validity(bbox)
+        same_chrom = background.dense_same_chrom(bbox)
+        oe = np.where(validity & same_chrom, oe, np.nan)
+
+        if sparse:
+            # NaNs are kept explicit so sparse and dense agree cell by cell.
+            return coo_matrix(oe)
+        return oe
 
     if as_pixels:
         # The historical behavior for as_pixels is to return only explicitly stored

@@ -79,6 +79,19 @@ cooler
 .. autofunction:: cooler.create_scool
 .. autofunction:: cooler.log_to_stderr
 
+Distance background
+~~~~~~~~~~~~~~~~~~~
+
+See :ref:`expected` for the full guide.
+
+.. autoclass:: cooler.ExpectedResult
+    :members:
+.. autofunction:: cooler.estimate_expected
+.. autofunction:: cooler.save_expected
+.. autofunction:: cooler.load_expected
+.. autofunction:: cooler.list_expected
+.. autofunction:: cooler.remove_expected
+
 
 ----
 

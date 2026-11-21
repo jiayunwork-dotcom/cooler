@@ -173,6 +173,66 @@ Storing a symmetric matrix requires only the *upper triangular part, including t
 .. warning:: In schema v2 and earlier, the symmetric-upper storage mode is always assumed.
 
 
+Expected-value analysis layers
+===============================
+
+.. versionadded:: 3
+
+    This is an extension to the format. Distance-background estimates produced by ``cooler.estimate_expected`` may be stored inside the cooler data collection in an optional group called ``expected``. Other cooler implementations may ignore this group.
+
+Each named layer is a group ``expected/<name>`` containing the per-chromosome, per-bucket statistics and the bindings needed to validate it against the rest of the collection::
+
+    expected: {
+      <name>: {
+        distance_edges: (Nbuckets + 1) * int64,   # half-open bp bucket edges
+        chrom_offset:    (Nchroms + 1) * int64,
+        chrom_name:      Nchroms * string,
+        valid:           Nbins * bool,            # bins participating in the estimate
+        mid2:            Nbins * int64,           # twice the bin midpoint (bp)
+        observed_sum:    Nchroms * Nbuckets * float64,
+        raw_sum:         Nchroms * Nbuckets * float64,
+        n_pairs:         Nchroms * Nbuckets * int64,
+        raw_mean:        Nchroms * Nbuckets * float64,
+        expected:        Nchroms * Nbuckets * float64,
+        usable:          Nchroms * Nbuckets * bool,
+        status:          Nchroms * Nbuckets * string,
+        weight:          Nbins * float64,         # only for weighted layers
+      }
+    }
+
+Layer attributes record the fitting policy and content-hash bindings:
+
+.. describe:: layer_format : int
+
+    Layout version of the layer group (currently 1).
+
+.. describe:: balance : bool
+
+    Whether the estimate uses balancing weights.
+
+.. describe:: weight_name : string
+
+    Source bin-table weight column (empty string for an unweighted layer).
+
+.. describe:: divisive_weights : bool
+
+    Whether the source weights are interpreted as divisive rather than multiplicative.
+
+.. describe:: policy : string (JSON)
+
+    Complete fitting policy, including ``stabilize`` and every stabilization parameter.
+
+.. describe:: bin_binding : string (JSON)
+
+    SHA-256 content hashes of the raw ``bins/chrom``, ``bins/start`` and ``bins/end`` datasets and the bin count.
+
+.. describe:: weight_binding : string (JSON) or empty
+
+    SHA-256 content hash and length of the canonical float64 weight vector. Empty for unweighted layers.
+
+A layer is valid only while its bin and weight bindings match the current collection. Layers are written through a temporary group and overwriting an existing name requires an explicit request, so a failed write never damages an existing layer. The raw pixel and bin data are treated as immutable; bindings are content hashes, so moving or copying the file does not invalidate a layer.
+
+
 Metadata
 ========
 
